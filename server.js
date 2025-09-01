@@ -13,6 +13,12 @@ app.use(bodyParser.json({
 const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN; // inventa uno
 const APP_SECRET   = process.env.META_APP_SECRET;   // de tu App Meta
 
+// Ruta raíz (diagnóstico)
+app.get("/", (_, res) => res.status(200).send("up"));
+
+// Healthcheck para Render
+app.get("/health", (_, res) => res.status(200).send("ok"));
+
 // 1) Verificación de Meta (GET)
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -52,9 +58,6 @@ app.post("/webhook", (req, res) => {
 
   return res.sendStatus(200);
 });
-
-// Healthcheck para Render
-app.get("/health", (_, res) => res.status(200).send("ok"));
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Webhook escuchando...");
