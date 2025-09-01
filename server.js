@@ -1,4 +1,4 @@
-// server.js — Meta Webhook + Kommo (atribución write-once)
+// server.js — Meta Webhook + Kommo (atribución write-once + fallbacks)
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -46,7 +46,7 @@ app.get("/webhook", (req, res) => {
 
 // ====== FIRMA HMAC (POST) ======
 function isValidSignature(req) {
-  if (!APP_SECRET) return true; // si no hay secreto, no bloqueamos (solo para pruebas)
+  if (!APP_SECRET) return true; // solo para pruebas (en prod, exige APP_SECRET)
   const received = req.get("x-hub-signature-256") || "";
   const expected = "sha256=" +
     crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
@@ -55,7 +55,7 @@ function isValidSignature(req) {
   catch { return false; }
 }
 
-// ====== OAUTH KOMMO: CALLBACK code -> tokens (úsalo 1 vez si vas por OAuth) ======
+// ====== OAUTH KOMMO: CALLBACK code -> tokens (1 vez si vas por OAuth) ======
 app.get("/kommo/oauth/callback", async (req, res) => {
   try {
     const code = req.query.code;
@@ -139,10 +139,10 @@ const FIELDS = {
     AD_ID:              2097589,
     PLATFORM:           2097591,
     CHANNEL_SOURCE:     2097593,
-    FIRST_TS:           2097597, // campo Fecha/Hora (UNIX segundos)
-    LAST_TS:            2097599, // campo Fecha/Hora (UNIX segundos)
+    FIRST_TS:           2097597, // UNIX segundos
+    LAST_TS:            2097599, // UNIX segundos
     THREAD_ID:          2097601,
-    ENTRY_OWNER_ID:     2097603,
+    ENTRY_OWNER_ID:     2097603, // WA: phone_number_id / FB: page_id
     CAMPAIGN_NAME:      2097605,
     MEDIA_BUDGET_HINT:  2097607,
     DEAL_AMOUNT:        2097609,
@@ -150,7 +150,8 @@ const FIELDS = {
 };
 
 // ====== HELPERS ======
-const unix = (ts) => (ts ? Number(ts) : null); // WA manda segundos (string) → Number
+const unix = (ts) => (ts ? Number(ts) : null);  // WA manda segundos (string) → Number
+const normE164 = (p) => (p ? (p.startsWith("+") ? p : `+${p}`) : null); // ★ normaliza tel
 
 // Convierte payload -> custom_fields_values (enviando fechas como UNIX)
 function leadCFV(p) {
@@ -190,7 +191,7 @@ function mergeAttribution(existingCFV = [], incomingPayload) {
   const m = cfvToMap(existingCFV);
   const out = { ...incomingPayload };
 
-  // WRITE-ONCE: si ya hay valor en el lead, lo conservamos
+  // WRITE-ONCE
   const keep = (fid, key) => {
     const have = m.get(fid);
     if (have != null && have !== "") out[key] = have;
@@ -236,16 +237,31 @@ async function findLeadByCtwa(clid) {
 async function findLeadByPhone(phoneE164) {
   if (!phoneE164) return null;
   const q = encodeURIComponent(phoneE164);
+  // contacto por teléfono
   const res = await kommoRequest(`/api/v4/contacts?query=${q}&limit=10`, { method: "GET" });
   const contact = res?._embedded?.contacts?.[0];
   if (!contact) return null;
 
+  // leads del contacto
   const det = await kommoRequest(`/api/v4/contacts/${contact.id}?with=leads`, { method: "GET" });
   const leads = det?._embedded?.leads || [];
   if (!leads.length) return null;
 
+  // más reciente
   leads.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
   return leads[0];
+}
+
+// ★ NUEVO: buscar por threadId (último recurso)
+async function findLeadByThreadId(tid) {
+  if (!tid) return null;
+  const q = encodeURIComponent(tid);
+  const res = await kommoRequest(`/api/v4/leads?query=${q}&limit=25`, { method: "GET" });
+  const leads = res?._embedded?.leads || [];
+  return leads.find(l =>
+    (l.custom_fields_values || []).some(cf => cf.field_id === FIELDS.LEAD.THREAD_ID &&
+      cf.values?.[0]?.value === tid)
+  ) || null;
 }
 
 async function createLeadOnly({ name, payload }) {
@@ -260,17 +276,13 @@ async function updateLeadCFV(leadId, payload) {
 }
 
 // Upsert inteligente + write-once de atribución
-async function upsertLeadSmart({ payload, phoneE164 }) {
+// ★ Orden completo: CTWA → TELÉFONO → THREAD
+async function upsertLeadSmart({ payload, phoneE164, threadId }) {
   let lead = null;
 
-  // 1) Intento por CTWA
-  if (payload.ctwa_clid) {
-    lead = await findLeadByCtwa(payload.ctwa_clid);
-  }
-  // 2) Fallback por teléfono
-  if (!lead && phoneE164) {
-    lead = await findLeadByPhone(phoneE164);
-  }
+  if (payload.ctwa_clid) lead = await findLeadByCtwa(payload.ctwa_clid);
+  if (!lead && phoneE164) lead = await findLeadByPhone(phoneE164);
+  if (!lead && threadId)  lead = await findLeadByThreadId(threadId);
 
   if (lead) {
     const merged = mergeAttribution(lead.custom_fields_values, payload);
@@ -278,7 +290,6 @@ async function upsertLeadSmart({ payload, phoneE164 }) {
     return { lead, created: false };
   }
 
-  // 3) Crear nuevo (primera vez que vemos este contacto)
   const created = await createLeadOnly({
     name: `Chat ${payload.platform?.toUpperCase() || "MSG"} ${phoneE164 ? `(${phoneE164})` : ""}`.trim(),
     payload
@@ -291,46 +302,95 @@ app.post("/webhook", async (req, res) => {
   if (!isValidSignature(req)) return res.sendStatus(401);
 
   try {
+    // WhatsApp e Instagram usan "changes"; Messenger usa "entry[].messaging[]"
+    const object = req.body.object;
+
+    // ──────────────── WhatsApp ────────────────
     const entry  = req.body.entry?.[0];
     const change = entry?.changes?.[0];
     const value  = change?.value;
 
-    const platform = (value?.messaging_product || "whatsapp").toLowerCase();
+    const messagingProduct = (value?.messaging_product || "").toLowerCase();
 
-    // WhatsApp
-    const waMsg     = value?.messages?.[0];
-    const referral  = waMsg?.referral || value?.referral || null;
-    const ctwaClid  = referral?.ctwa_clid || referral?.click_id || null;
-    const userPhone = waMsg?.from || null; // E164
+    if (messagingProduct === "whatsapp") {
+      const waMsg     = value?.messages?.[0];
+      const referral  = waMsg?.referral || value?.referral || null;
+      const ctwaClid  = referral?.ctwa_clid || referral?.click_id || null;
 
-    const payload = {
-      platform,
-      channel_source: referral ? "ctwa" : platform,
-      ctwa_clid:   ctwaClid,
-      campaign_id: referral?.campaign_id || null,
-      adset_id:    referral?.adset_id    || null,
-      ad_id:       referral?.ad_id       || null,
+      const metadata  = value?.metadata || {};
+      const phoneNumberId   = metadata.phone_number_id || entry?.id || null; // ★ usar metadata primero
+      // const displayPhone    = metadata.display_phone_number || null;       // si luego quieres guardarlo
 
-      // Fechas como UNIX (segundos)
-      first_message_unix: unix(waMsg?.timestamp),
-      last_message_unix:  unix(waMsg?.timestamp),
+      const userPhone = normE164(waMsg?.from); // ★ normalizado
+      const ts = unix(waMsg?.timestamp);
 
-      thread_id:      waMsg?.id || null,
-      entry_owner_id: entry?.id || null,
+      const payload = {
+        platform: "whatsapp",
+        channel_source: referral ? "ctwa" : "whatsapp",
+        ctwa_clid:   ctwaClid,
+        campaign_id: referral?.campaign_id || null,
+        adset_id:    referral?.adset_id    || null,
+        ad_id:       referral?.ad_id       || null,
 
-      // opcionales (rellenar luego si quieres)
-      campaign_name:     null,
-      media_budget_hint: null,
-      deal_amount:       null,
-    };
+        first_message_unix: ts,
+        last_message_unix:  ts,
 
-    console.log("INBOUND EVENT:", JSON.stringify(req.body, null, 2));
-    console.log("CTWA_CLICK_ID:", ctwaClid || "(no referral)");
-    console.log("USER PHONE:", userPhone || "(desconocido)");
+        thread_id:      waMsg?.id || null,
+        entry_owner_id: phoneNumberId, // ★ guardamos phone_number_id en tu campo WABA/Page/IG ID
 
-    // Upsert con atribución write-once + fallback por teléfono
-    const { lead, created } = await upsertLeadSmart({ payload, phoneE164: userPhone });
-    console.log(`LEAD Kommo ${created ? "creado" : "actualizado"}:`, lead?.id || "(sin id)");
+        campaign_name:     null,
+        media_budget_hint: null,
+        deal_amount:       null,
+      };
+
+      console.log("INBOUND WA:", JSON.stringify(req.body, null, 2));
+      console.log("CTWA_CLICK_ID:", ctwaClid || "(no referral)");
+      console.log("USER PHONE:", userPhone || "(desconocido)");
+
+      // Upsert con orden completo (CTWA → TEL → THREAD)
+      const { lead, created } = await upsertLeadSmart({
+        payload,
+        phoneE164: userPhone,
+        threadId: payload.thread_id
+      });
+      console.log(`LEAD Kommo ${created ? "creado" : "actualizado"}:`, lead?.id || "(sin id)");
+      return res.sendStatus(200);
+    }
+
+    // ──────────────── Messenger (Page) ────────────────
+    if (object === "page") {
+      const pageEntry = req.body.entry?.[0];
+      const msg = pageEntry?.messaging?.[0];
+      if (!msg) return res.sendStatus(200);
+
+      const pageId = pageEntry?.id || null;
+      const mid    = msg?.message?.mid || msg?.delivery?.mids?.[0] || null;
+      const referral = msg?.referral || msg?.postback?.referral || null;
+
+      const payload = {
+        platform: "messenger",
+        channel_source: referral ? "ctm" : "messenger",
+        ctwa_clid: null, // Messenger no usa ctwa_clid
+
+        first_message_unix: Math.floor(Date.now()/1000),
+        last_message_unix:  Math.floor(Date.now()/1000),
+
+        thread_id:      mid,
+        entry_owner_id: pageId, // guardamos page_id en tu campo WABA/Page/IG ID
+      };
+
+      console.log("INBOUND MSG (Messenger):", JSON.stringify(req.body, null, 2));
+
+      const { lead, created } = await upsertLeadSmart({
+        payload,
+        phoneE164: null,           // normalmente no tenemos teléfono aquí
+        threadId: payload.thread_id
+      });
+      console.log(`LEAD Kommo ${created ? "creado" : "actualizado"}:`, lead?.id || "(sin id)");
+      return res.sendStatus(200);
+    }
+
+    // (Si más adelante activas Instagram DM, aquí podemos añadir la rama "object === 'instagram'").
 
     return res.sendStatus(200);
   } catch (e) {
