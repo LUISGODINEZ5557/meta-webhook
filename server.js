@@ -1,4 +1,4 @@
-// server.js — Meta Webhook + Kommo (write-once, sin crear leads, con búsqueda de teléfono robusta)
+// server.js — Meta Webhook + Kommo (write-once, sin crear leads, con búsqueda robusta y Ads enrichment)
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -10,11 +10,64 @@ app.use(bodyParser.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
 }));
 
-// ===== META =====
+/* ================= META ================= */
 const VERIFY_TOKEN = (process.env.META_VERIFY_TOKEN || "").trim();
 const APP_SECRET   = process.env.META_APP_SECRET;
 
-// ===== KOMMO =====
+/* ===== Graph API (Ads) ===== */
+const GRAPH_VER  = process.env.META_GRAPH_VERSION || "v20.0";
+const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_VER}`;
+const ADS_TOKEN  = process.env.META_ADS_TOKEN || null;
+
+async function graphGet(path, params = {}) {
+  if (!ADS_TOKEN) return null;
+  const qs  = new URLSearchParams({ access_token: ADS_TOKEN, ...params }).toString();
+  const url = `${GRAPH_BASE}${path}?${qs}`;
+  const r   = await fetch(url);
+  const txt = await r.text();
+  if (!r.ok) {
+    console.error("[ADS API ERROR]", r.status, txt);
+    throw new Error(`Graph ${r.status}: ${txt}`);
+  }
+  try { return JSON.parse(txt); } catch { return null; }
+}
+
+/** Completa campaign/adset/ad (y nombre campaña) usando el ID más específico disponible */
+async function enrichFromAds(ref = {}) {
+  if (!ADS_TOKEN) return {};
+  const out = {};
+  try {
+    if (ref.ad_id) {
+      const ad = await graphGet(`/${ref.ad_id}`, {
+        fields: "id,name,adset_id,campaign_id,adset{name},campaign{name}"
+      });
+      if (ad?.id) out.ad_id = ad.id;
+      if (ad?.adset_id) out.adset_id = ad.adset_id;
+      if (ad?.campaign_id) out.campaign_id = ad.campaign_id;
+      out.campaign_name = ad?.campaign?.name || out.campaign_name || null;
+    } else if (ref.adset_id) {
+      const adset = await graphGet(`/${ref.adset_id}`, {
+        fields: "id,name,campaign_id,campaign{name}"
+      });
+      if (adset?.id) out.adset_id = adset.id;
+      if (adset?.campaign_id) out.campaign_id = adset.campaign_id;
+      out.campaign_name = adset?.campaign?.name || out.campaign_name || null;
+    } else if (ref.campaign_id) {
+      const camp = await graphGet(`/${ref.campaign_id}`, { fields: "id,name" });
+      if (camp?.id) out.campaign_id = camp.id;
+      out.campaign_name = camp?.name || out.campaign_name || null;
+    }
+  } catch (e) {
+    console.error("[ADS ENRICH ERROR]", e.message || e);
+  }
+  // limpia nulos
+  for (const k of Object.keys(out)) {
+    if (out[k] === null || out[k] === undefined || out[k] === "") delete out[k];
+  }
+  return out;
+}
+
+/* ================= KOMMO ================= */
 const KOMMO = {
   base: (process.env.KOMMO_BASE || "").replace(/\/+$/, ""),
   clientId: process.env.KOMMO_CLIENT_ID,
@@ -24,10 +77,11 @@ const KOMMO = {
   refreshToken: process.env.KOMMO_REFRESH_TOKEN || null,
 };
 
+/* ================= DIAGNÓSTICO ================= */
 app.get("/",  (_, res) => res.status(200).send("up"));
 app.get("/health", (_, res) => res.status(200).send("ok"));
 
-// ========== VERIFY GET ==========
+/* ================= VERIFY (GET) ================= */
 app.get("/webhook", (req, res) => {
   const mode = (req.query["hub.mode"] || "").trim();
   const token = (req.query["hub.verify_token"] || "").trim();
@@ -42,9 +96,9 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// ========== HMAC ==========
+/* ================= HMAC (POST) ================= */
 function isValidSignature(req) {
-  if (!APP_SECRET) return true; // solo pruebas
+  if (!APP_SECRET) return true; // pruebas
   const received = req.get("x-hub-signature-256") || "";
   const expected = "sha256=" +
     crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
@@ -53,7 +107,7 @@ function isValidSignature(req) {
   catch { return false; }
 }
 
-// ========== OAUTH CALLBACK ==========
+/* ================= OAUTH CALLBACK (Kommo) ================= */
 app.get("/kommo/oauth/callback", async (req, res) => {
   try {
     const code = req.query.code;
@@ -84,7 +138,7 @@ app.get("/kommo/oauth/callback", async (req, res) => {
   }
 });
 
-// ========== REFRESH & REQUEST ==========
+/* ================= REFRESH & REQUEST (Kommo) ================= */
 async function kommoRefresh() {
   const r = await fetch(`${KOMMO.base}/oauth2/access_token`, {
     method: "POST",
@@ -128,7 +182,7 @@ async function kommoRequest(path, options = {}, retry = true) {
   try { return await r.json(); } catch { return null; }
 }
 
-// ========== CAMPOS (IDs que me diste) ==========
+/* ================= CAMPOS (IDs Kommo) ================= */
 const FIELDS = {
   LEAD: {
     CTWA_CLID:          2097583,
@@ -147,7 +201,7 @@ const FIELDS = {
   }
 };
 
-// ========== HELPERS ==========
+/* ================= HELPERS ================= */
 const unix = (ts) => (ts ? Number(ts) : null);
 const num  = (v) => (v == null || v === "" ? null : Number(v) || null);
 const asArray = (v) => Array.isArray(v) ? v : [];
@@ -212,25 +266,23 @@ function mergeAttribution(existingCFV = [], incomingPayload) {
   return out;
 }
 
-// ========== NORMALIZACIÓN DE TELÉFONO ==========
+/* ===== Teléfono: normalización para buscar en Kommo ===== */
 function phoneCandidates(raw) {
   if (!raw) return [];
   const digits = String(raw).replace(/\D+/g, "");
   const cands = new Set();
 
-  // WhatsApp 'from' ya suele venir E164 sin '+'
-  cands.add(digits);                 // 5213312345678
-  cands.add("+" + digits);           // +5213312345678
-  // Últimos 10 (Mx) — útil si Kommo guarda así
+  cands.add(digits);           // 5213312345678
+  cands.add("+" + digits);     // +5213312345678
   if (digits.length >= 10) {
     const last10 = digits.slice(-10);
     cands.add(last10);
-    cands.add("+52" + last10);       // ajusta si tu país no es MX
+    cands.add("+52" + last10); // ajusta prefijo país si aplica
   }
   return Array.from(cands);
 }
 
-// ========== LECTURA / UPDATE EN KOMMO ==========
+/* ================= LECTURA / UPDATE EN KOMMO ================= */
 async function getLeadById(id) {
   if (!id) return null;
   try {
@@ -315,7 +367,7 @@ async function updateExistingLead({ payload, phoneE164 }) {
   return { updated: true, leadId: lead.id };
 }
 
-// ========== WEBHOOK POST ==========
+/* ================= WEBHOOK (POST) ================= */
 app.post("/webhook", async (req, res) => {
   if (!isValidSignature(req)) return res.sendStatus(401);
 
@@ -357,6 +409,19 @@ app.post("/webhook", async (req, res) => {
       deal_amount:       null,
     };
 
+    // Completar con Ads si falta info relevante
+    const needAds = !payload.ad_id || !payload.adset_id || !payload.campaign_id || !payload.campaign_name;
+    if (needAds) {
+      const adsExtra = await enrichFromAds({
+        ad_id: payload.ad_id,
+        adset_id: payload.adset_id,
+        campaign_id: payload.campaign_id
+      });
+      for (const [k, v] of Object.entries(adsExtra)) {
+        if (!payload[k]) payload[k] = v; // no pisa si ya venía
+      }
+    }
+
     console.log("=== INBOUND EVENT ===");
     console.log("platform:", payload.platform, "ctwa:", ctwaClid ? "sí" : "(no)");
     console.log("phone (raw WA):", userPhone || "(desconocido)");
@@ -372,6 +437,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+/* ================= START ================= */
 app.listen(process.env.PORT || 3000, () => {
   console.log("Webhook escuchando...");
 });
