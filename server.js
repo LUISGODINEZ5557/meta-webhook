@@ -1,4 +1,4 @@
-// server.js — Meta Webhook + Kommo (atribución write-once, sin crear leads nuevos)
+// server.js — Meta Webhook + Kommo (write-once, sin crear leads, con búsqueda de teléfono robusta)
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -6,22 +6,15 @@ import crypto from "crypto";
 
 const app = express();
 
-// ======================================================
-// MIDDLEWARE: cuerpo crudo para validar firma HMAC
-// ======================================================
 app.use(bodyParser.json({
   verify: (req, res, buf) => { req.rawBody = buf; }
 }));
 
-// ======================================================
-// ENV (Meta)
-// ======================================================
+// ===== META =====
 const VERIFY_TOKEN = (process.env.META_VERIFY_TOKEN || "").trim();
 const APP_SECRET   = process.env.META_APP_SECRET;
 
-// ======================================================
-// ENV (Kommo)
-// ======================================================
+// ===== KOMMO =====
 const KOMMO = {
   base: (process.env.KOMMO_BASE || "").replace(/\/+$/, ""),
   clientId: process.env.KOMMO_CLIENT_ID,
@@ -31,14 +24,10 @@ const KOMMO = {
   refreshToken: process.env.KOMMO_REFRESH_TOKEN || null,
 };
 
-// ======================================================
-/** DIAGNÓSTICO **/
 app.get("/",  (_, res) => res.status(200).send("up"));
 app.get("/health", (_, res) => res.status(200).send("ok"));
 
-// ======================================================
-// WEBHOOK VERIFY (GET)
-// ======================================================
+// ========== VERIFY GET ==========
 app.get("/webhook", (req, res) => {
   const mode = (req.query["hub.mode"] || "").trim();
   const token = (req.query["hub.verify_token"] || "").trim();
@@ -53,11 +42,9 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-// ======================================================
-// FIRMA HMAC (POST)
-// ======================================================
+// ========== HMAC ==========
 function isValidSignature(req) {
-  if (!APP_SECRET) return true; // Solo para pruebas locales
+  if (!APP_SECRET) return true; // solo pruebas
   const received = req.get("x-hub-signature-256") || "";
   const expected = "sha256=" +
     crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
@@ -66,9 +53,7 @@ function isValidSignature(req) {
   catch { return false; }
 }
 
-// ======================================================
-// OAUTH KOMMO: CALLBACK (úsalo 1 vez para obtener tokens)
-// ======================================================
+// ========== OAUTH CALLBACK ==========
 app.get("/kommo/oauth/callback", async (req, res) => {
   try {
     const code = req.query.code;
@@ -88,20 +73,18 @@ app.get("/kommo/oauth/callback", async (req, res) => {
 
     KOMMO.accessToken  = data.access_token;
     KOMMO.refreshToken = data.refresh_token;
-    console.log("KOMMO TOKENS (copia a Render y redepliega):", {
+    console.log("KOMMO TOKENS (copia en Render y redeploy):", {
       access_token: KOMMO.accessToken,
       refresh_token: KOMMO.refreshToken,
     });
-    return res.status(200).send("OK. Revisa logs de Render y copia access_token / refresh_token a Environment.");
+    return res.status(200).send("OK. Copia tokens desde logs a Environment y redepliega.");
   } catch (e) {
     console.error("OAuth callback error:", e);
     return res.sendStatus(500);
   }
 });
 
-// ======================================================
-// REFRESH TOKEN KOMMO
-// ======================================================
+// ========== REFRESH & REQUEST ==========
 async function kommoRefresh() {
   const r = await fetch(`${KOMMO.base}/oauth2/access_token`, {
     method: "POST",
@@ -118,38 +101,34 @@ async function kommoRefresh() {
   if (!r.ok) throw new Error(`Refresh failed: ${JSON.stringify(data)}`);
   KOMMO.accessToken  = data.access_token;
   KOMMO.refreshToken = data.refresh_token;
-  console.log("KOMMO TOKENS REFRESHED:", {
-    access_token: KOMMO.accessToken,
-    refresh_token: KOMMO.refreshToken,
-  });
+  console.log("KOMMO TOKENS REFRESHED");
 }
 
-// ======================================================
-// REQUEST WRAPPER KOMMO (retry en 401)
-// ======================================================
 async function kommoRequest(path, options = {}, retry = true) {
-  const r = await fetch(`${KOMMO.base}${path}`, {
+  const url = `${KOMMO.base}${path}`;
+  const r = await fetch(url, {
     ...options,
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${KOMMO.accessToken}`,
+      "User-Agent": "meta-webhook-kommo/1.0",
       ...(options.headers || {}),
     },
   });
   if (r.status === 401 && retry && KOMMO.refreshToken) {
+    console.warn("401 en Kommo. Intentando refresh...");
     await kommoRefresh();
     return kommoRequest(path, options, false);
   }
   if (!r.ok) {
     const t = await r.text().catch(() => "");
+    console.error(`Kommo ${r.status} ${url} ::`, t);
     throw new Error(`Kommo ${r.status}: ${t}`);
   }
   try { return await r.json(); } catch { return null; }
 }
 
-// ======================================================
-// FIELD IDs (Kommo LEAD) — proporcionados por ti
-// ======================================================
+// ========== CAMPOS (IDs que me diste) ==========
 const FIELDS = {
   LEAD: {
     CTWA_CLID:          2097583,
@@ -158,8 +137,8 @@ const FIELDS = {
     AD_ID:              2097589,
     PLATFORM:           2097591,
     CHANNEL_SOURCE:     2097593,
-    FIRST_TS:           2097597, // Fecha/Hora (UNIX s)
-    LAST_TS:            2097599, // Fecha/Hora (UNIX s)
+    FIRST_TS:           2097597,
+    LAST_TS:            2097599,
     THREAD_ID:          2097601,
     ENTRY_OWNER_ID:     2097603,
     CAMPAIGN_NAME:      2097605,
@@ -168,10 +147,8 @@ const FIELDS = {
   }
 };
 
-// ======================================================
-// HELPERS
-// ======================================================
-const unix = (ts) => (ts ? Number(ts) : null); // WA manda segundos (string) → Number
+// ========== HELPERS ==========
+const unix = (ts) => (ts ? Number(ts) : null);
 const num  = (v) => (v == null || v === "" ? null : Number(v) || null);
 const asArray = (v) => Array.isArray(v) ? v : [];
 
@@ -185,7 +162,6 @@ function cfvToMap(custom_fields_values) {
   return m;
 }
 
-// Convierte payload -> custom_fields_values (fechas en UNIX s)
 function leadCFV(p) {
   const out = [];
   const add = (id, v) => (v !== null && v !== undefined && v !== "") &&
@@ -206,17 +182,13 @@ function leadCFV(p) {
   return out;
 }
 
-// Congela (write-once) los campos de atribución y mantiene fechas coherentes
 function mergeAttribution(existingCFV = [], incomingPayload) {
   const m = cfvToMap(existingCFV);
   const out = { ...incomingPayload };
-
-  // WRITE-ONCE: si ya hay valor, se conserva
   const keep = (fid, key) => {
     const have = m.get(fid);
     if (have != null && have !== "") out[key] = have;
   };
-
   keep(FIELDS.LEAD.CTWA_CLID,      "ctwa_clid");
   keep(FIELDS.LEAD.CAMPAIGN_ID,    "campaign_id");
   keep(FIELDS.LEAD.ADSET_ID,       "adset_id");
@@ -224,7 +196,6 @@ function mergeAttribution(existingCFV = [], incomingPayload) {
   keep(FIELDS.LEAD.PLATFORM,       "platform");
   keep(FIELDS.LEAD.CHANNEL_SOURCE, "channel_source");
 
-  // Fechas (UNIX s): first = mínimo; last = máximo
   const firstOld = num(m.get(FIELDS.LEAD.FIRST_TS));
   const lastOld  = num(m.get(FIELDS.LEAD.LAST_TS));
   const firstNew = num(incomingPayload.first_message_unix);
@@ -241,9 +212,25 @@ function mergeAttribution(existingCFV = [], incomingPayload) {
   return out;
 }
 
-// ======================================================
-// KOMMO: helpers de lectura/actualización
-// ======================================================
+// ========== NORMALIZACIÓN DE TELÉFONO ==========
+function phoneCandidates(raw) {
+  if (!raw) return [];
+  const digits = String(raw).replace(/\D+/g, "");
+  const cands = new Set();
+
+  // WhatsApp 'from' ya suele venir E164 sin '+'
+  cands.add(digits);                 // 5213312345678
+  cands.add("+" + digits);           // +5213312345678
+  // Últimos 10 (Mx) — útil si Kommo guarda así
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    cands.add(last10);
+    cands.add("+52" + last10);       // ajusta si tu país no es MX
+  }
+  return Array.from(cands);
+}
+
+// ========== LECTURA / UPDATE EN KOMMO ==========
 async function getLeadById(id) {
   if (!id) return null;
   try {
@@ -268,56 +255,67 @@ async function findLeadByCtwa(clid) {
   return full || match;
 }
 
-// Busca contacto por teléfono y devuelve su lead más reciente (completo)
-async function findLeadByPhone(phoneE164) {
-  if (!phoneE164) return null;
-  const q = encodeURIComponent(phoneE164);
-  const res = await kommoRequest(`/api/v4/contacts?query=${q}&limit=10`, { method: "GET" });
-  const contact = res?._embedded?.contacts?.[0];
-  if (!contact) return null;
+async function findLeadByPhone(rawPhone) {
+  const tries = phoneCandidates(rawPhone);
+  if (!tries.length) return null;
 
-  const det = await kommoRequest(`/api/v4/contacts/${contact.id}?with=leads`, { method: "GET" });
-  const leads = det?._embedded?.leads || [];
-  if (!leads.length) return null;
+  console.log("[PHONE MATCH] Probar variantes:", tries.join(", "));
+  for (const qRaw of tries) {
+    const q = encodeURIComponent(qRaw);
+    try {
+      const res = await kommoRequest(`/api/v4/contacts?query=${q}&limit=10`, { method: "GET" });
+      const contact = res?._embedded?.contacts?.[0];
+      if (!contact) continue;
 
-  leads.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
-  const latest = leads[0];
-  const full = await getLeadById(latest.id);
-  return full || latest;
+      const det = await kommoRequest(`/api/v4/contacts/${contact.id}?with=leads`, { method: "GET" });
+      const leads = det?._embedded?.leads || [];
+      if (!leads.length) continue;
+
+      leads.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+      const latest = leads[0];
+      const full = await getLeadById(latest.id);
+      console.log("[PHONE MATCH] Encontrado contacto", contact.id, "lead", latest.id);
+      return full || latest;
+    } catch (e) {
+      console.warn("Búsqueda por teléfono falló con", qRaw, "->", e.message || e);
+    }
+  }
+  return null;
 }
 
 async function updateLeadCFV(leadId, payload) {
-  const body = [{ id: leadId, custom_fields_values: leadCFV(payload) }];
+  const cfv = leadCFV(payload);
+  console.log("[PATCH] lead", leadId, "custom_fields_values:", JSON.stringify(cfv));
+  const body = [{ id: leadId, custom_fields_values: cfv }];
   await kommoRequest(`/api/v4/leads`, { method: "PATCH", body: JSON.stringify(body) });
+  console.log("[PATCH OK] lead", leadId);
 }
 
-// Upsert “sin crear”: sólo actualiza si encuentra
+// Solo ACTUALIZA si encuentra (no crea)
 async function updateExistingLead({ payload, phoneE164 }) {
   let lead = null;
 
-  // 1) Intento por CTWA
   if (payload.ctwa_clid) {
     lead = await findLeadByCtwa(payload.ctwa_clid);
+    if (lead) console.log("[MATCH] por CTWA en lead", lead.id);
   }
-  // 2) Fallback por teléfono
+
   if (!lead && phoneE164) {
     lead = await findLeadByPhone(phoneE164);
+    if (lead) console.log("[MATCH] por teléfono en lead", lead.id);
   }
 
   if (!lead) {
-    console.log("[NO MATCH] No se encontró lead por CTWA ni por teléfono. No se crea.");
+    console.log("[NO MATCH] Sin coincidencia por CTWA ni teléfono. No se crea.");
     return { updated: false, leadId: null };
   }
 
-  console.log("[MATCH] Lead a actualizar:", lead.id);
   const merged = mergeAttribution(lead.custom_fields_values, payload);
   await updateLeadCFV(lead.id, merged);
   return { updated: true, leadId: lead.id };
 }
 
-// ======================================================
-// WEBHOOK EVENTS (POST) — enfocamos en WhatsApp (ctwa / phone)
-// ======================================================
+// ========== WEBHOOK POST ==========
 app.post("/webhook", async (req, res) => {
   if (!isValidSignature(req)) return res.sendStatus(401);
 
@@ -326,24 +324,22 @@ app.post("/webhook", async (req, res) => {
     const change = entry?.changes?.[0];
     const value  = change?.value;
 
-    // Sólo procesamos WhatsApp; otros productos se ignoran sin error
     const product = (value?.messaging_product || "").toLowerCase();
     if (product && product !== "whatsapp") {
-      console.log("Evento no-WhatsApp recibido, ignorando de forma segura.");
+      console.log("Evento no-WhatsApp recibido; se ignora.");
       return res.sendStatus(200);
     }
 
-    const waMsg     = value?.messages?.[0];
+    const waMsg = value?.messages?.[0];
     if (!waMsg) {
-      console.log("Sin messages[0] (WhatsApp), nada que procesar.");
+      console.log("Sin messages[0]; nada que hacer.");
       return res.sendStatus(200);
     }
 
     const referral  = waMsg?.referral || value?.referral || null;
     const ctwaClid  = referral?.ctwa_clid || referral?.click_id || null;
-    const userPhone = waMsg?.from || null; // E164
-
-    const ts = unix(waMsg?.timestamp);
+    const userPhone = waMsg?.from || null;
+    const ts        = unix(waMsg?.timestamp);
 
     const payload = {
       platform:       "whatsapp",
@@ -352,15 +348,10 @@ app.post("/webhook", async (req, res) => {
       campaign_id:    referral?.campaign_id || null,
       adset_id:       referral?.adset_id    || null,
       ad_id:          referral?.ad_id       || null,
-
-      // Fechas como UNIX (segundos)
       first_message_unix: ts,
       last_message_unix:  ts,
-
       thread_id:      waMsg?.id || null,
       entry_owner_id: entry?.id || null,
-
-      // opcionales (rellenar después si los usas)
       campaign_name:     null,
       media_budget_hint: null,
       deal_amount:       null,
@@ -368,15 +359,11 @@ app.post("/webhook", async (req, res) => {
 
     console.log("=== INBOUND EVENT ===");
     console.log("platform:", payload.platform, "ctwa:", ctwaClid ? "sí" : "(no)");
-    console.log("phone:", userPhone || "(desconocido)");
+    console.log("phone (raw WA):", userPhone || "(desconocido)");
 
-    // Actualiza SIN crear
     const { updated, leadId } = await updateExistingLead({ payload, phoneE164: userPhone });
-    if (updated) {
-      console.log("[OK] Lead actualizado:", leadId);
-    } else {
-      console.log("[SKIP] No se actualizó (no hubo match).");
-    }
+    if (updated) console.log("[OK] Lead actualizado:", leadId);
+    else         console.log("[SKIP] No se actualizó (sin match).");
 
     return res.sendStatus(200);
   } catch (e) {
@@ -385,9 +372,6 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ======================================================
-// START SERVER
-// ======================================================
 app.listen(process.env.PORT || 3000, () => {
   console.log("Webhook escuchando...");
 });
