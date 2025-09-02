@@ -1,4 +1,5 @@
-// server.js — Meta Webhook + Kommo (write-once, sin crear leads, retries 5/10/15 min, backoff y Ads enrichment)
+// server.js — Meta Webhook + Kommo (LLT: sin refresh), write-once, respuesta inmediata,
+// retries 5/10/15 min (coalescencia), fast-probe opcional y Ads enrichment opcional.
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -63,24 +64,18 @@ async function enrichFromAds(ref = {}) {
   return out;
 }
 
-/* ================= KOMMO ================= */
+/* ================= KOMMO (LLT: sin refresh) ================= */
 const KOMMO = {
   base: (process.env.KOMMO_BASE || "").replace(/\/+$/, ""),
-  clientId: process.env.KOMMO_CLIENT_ID,
-  clientSecret: process.env.KOMMO_CLIENT_SECRET,
-  redirectUri: process.env.KOMMO_REDIRECT_URI,
-  accessToken: process.env.KOMMO_ACCESS_TOKEN || null,
-  refreshToken: process.env.KOMMO_REFRESH_TOKEN || null,
+  accessToken: process.env.KOMMO_ACCESS_TOKEN || "", // ← token de larga duración
 };
 
 /* ================= RETRIES ANTI-RACE =================
    Reintentos a 5, 10 y 15 minutos si Kommo aún no creó el lead/contacto.
+   Coalescencia: 1 timer por key (ctwa o teléfono). Fast-probe opcional: 20s.
 ======================================================= */
-const ANTI_RACE = {
-  enabled: true,
-  delayMs: 5 * 60 * 1000,   // 5 minutos entre intentos
-  attempts: 3               // 5, 10, 15 min
-};
+const ANTI_RACE = { enabled: true, delayMs: 5 * 60 * 1000, attempts: 3 };
+const FAST_PROBE = process.env.FAST_PROBE === "1";
 const pendingRetries = new Map(); // key -> { timer, attempt }
 
 /* ================= DIAGNÓSTICO ================= */
@@ -113,58 +108,8 @@ function isValidSignature(req) {
   catch { return false; }
 }
 
-/* ================= OAUTH CALLBACK (Kommo, opcional) ================= */
-app.get("/kommo/oauth/callback", async (req, res) => {
-  try {
-    const code = req.query.code;
-    const r = await fetch(`${KOMMO.base}/oauth2/access_token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: KOMMO.clientId,
-        client_secret: KOMMO.clientSecret,
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: KOMMO.redirectUri,
-      }),
-    });
-    const data = await r.json();
-    if (!r.ok) return res.status(400).send(data);
-
-    KOMMO.accessToken  = data.access_token;
-    KOMMO.refreshToken = data.refresh_token;
-    console.log("KOMMO TOKENS (copia en Render y redeploy):", {
-      access_token: KOMMO.accessToken,
-      refresh_token: KOMMO.refreshToken,
-    });
-    return res.status(200).send("OK. Copia tokens desde logs a Environment y redepliega.");
-  } catch (e) {
-    console.error("OAuth callback error:", e);
-    return res.sendStatus(500);
-  }
-});
-
-/* ================= KOMMO REQUEST (con backoff) ================= */
+/* ================= KOMMO REQUEST (sin refresh; con backoff) ================= */
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-async function kommoRefresh() {
-  const r = await fetch(`${KOMMO.base}/oauth2/access_token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      client_id: KOMMO.clientId,
-      client_secret: KOMMO.clientSecret,
-      grant_type: "refresh_token",
-      refresh_token: KOMMO.refreshToken,
-      redirect_uri: KOMMO.redirectUri,
-    }),
-  });
-  const data = await r.json();
-  if (!r.ok) throw new Error(`Refresh failed: ${JSON.stringify(data)}`);
-  KOMMO.accessToken  = data.access_token;
-  KOMMO.refreshToken = data.refresh_token;
-  console.log("KOMMO TOKENS REFRESHED");
-}
 
 async function kommoRequest(path, options = {}) {
   const url = `${KOMMO.base}${path}`;
@@ -179,17 +124,19 @@ async function kommoRequest(path, options = {}) {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${KOMMO.accessToken}`,
-        "User-Agent": "meta-webhook-kommo/1.2",
+        "User-Agent": "meta-webhook-kommo/LLT-1.0",
         ...(options.headers || {}),
       },
     });
     const ms = Date.now() - started;
 
-    if (r.status === 401 && KOMMO.refreshToken && attempt <= 2) {
-      console.warn(`Kommo 401 → refresh token... (${ms}ms)`);
-      await kommoRefresh();
-      continue;
+    // LLT: no hay refresh. Si 401, avisamos y abortamos.
+    if (r.status === 401) {
+      const t = await r.text().catch(() => "");
+      console.error(`Kommo 401 (token inválido/expirado). Reemplaza KOMMO_ACCESS_TOKEN. Resp: ${t}`);
+      throw new Error(`Kommo 401: ${t}`);
     }
+
     if ((r.status === 429 || (r.status >= 500 && r.status <= 599)) && attempt <= 5) {
       const retryAfter = Number(r.headers.get("Retry-After")) || 0;
       const wait = Math.max(retryAfter * 1000, delay);
@@ -198,11 +145,13 @@ async function kommoRequest(path, options = {}) {
       delay = Math.min(delay * 2, 30_000);
       continue;
     }
+
     if (!r.ok) {
       const t = await r.text().catch(() => "");
       console.error(`Kommo ${r.status} ${url} (${ms}ms)::`, t);
       throw new Error(`Kommo ${r.status}: ${t}`);
     }
+
     try { return await r.json(); } catch { return null; }
   }
 }
@@ -385,110 +334,125 @@ async function tryUpdateOnce({ payload, phoneE164 }) {
   return true;
 }
 
-/* ===== Programación de reintentos a 5/10/15 min ===== */
+/* ===== Programación de reintentos a 5/10/15 min con coalescencia + fast-probe opcional ===== */
 function scheduleAntiRace(key, payload, phoneE164) {
   if (!ANTI_RACE.enabled) return;
 
-  const current = pendingRetries.get(key);
-  const attempt = current ? current.attempt + 1 : 1;
-  if (attempt > ANTI_RACE.attempts) {
-    if (current) pendingRetries.delete(key);
-    console.warn(`[ANTI-RACE] Abandonado ${key} tras ${attempt - 1} intentos`);
+  const existing = pendingRetries.get(key);
+  if (existing?.timer) {
+    console.log(`[ANTI-RACE] Ya hay un intento programado para ${key}; omito duplicar.`);
     return;
   }
 
-  const delay = ANTI_RACE.delayMs; // siempre 5 minutos entre intentos
-  console.log(`[ANTI-RACE] Intento #${attempt} para ${key} en ${Math.round(delay/60000)} min`);
+  if (FAST_PROBE) {
+    const t20 = setTimeout(async () => {
+      pendingRetries.delete(key);
+      try {
+        const ok = await tryUpdateOnce({ payload, phoneE164 });
+        if (ok) { console.log(`[FAST_PROBE] Éxito para ${key}`); return; }
+      } catch (e) {
+        console.warn("[FAST_PROBE ERROR]", e.message || e);
+      }
+      _scheduleSeries(key, payload, phoneE164, 1); // 5/10/15
+    }, 20_000);
+    pendingRetries.set(key, { timer: t20, attempt: 0 });
+    return;
+  }
 
+  _scheduleSeries(key, payload, phoneE164, 1);
+}
+
+function _scheduleSeries(key, payload, phoneE164, attempt) {
+  if (attempt > ANTI_RACE.attempts) {
+    pendingRetries.delete(key);
+    console.warn(`[ANTI-RACE] Abandonado ${key} tras ${attempt - 1} intentos`);
+    return;
+  }
+  const delay = ANTI_RACE.delayMs; // 5 min
+  console.log(`[ANTI-RACE] Intento #${attempt} para ${key} en ${Math.round(delay/60000)} min`);
   const timer = setTimeout(async () => {
     pendingRetries.delete(key);
     try {
       const ok = await tryUpdateOnce({ payload, phoneE164 });
-      if (!ok) scheduleAntiRace(key, payload, phoneE164);
+      if (!ok) _scheduleSeries(key, payload, phoneE164, attempt + 1);
       else console.log(`[ANTI-RACE] Actualización lograda para ${key} en intento #${attempt}`);
     } catch (e) {
       console.error("[ANTI-RACE ERROR]", e.message || e);
-      scheduleAntiRace(key, payload, phoneE164);
+      _scheduleSeries(key, payload, phoneE164, attempt + 1);
     }
   }, delay);
-
   pendingRetries.set(key, { timer, attempt });
 }
 
-/* ================= WEBHOOK (POST) ================= */
+/* ================= WEBHOOK (POST) — Respuesta inmediata ================= */
 app.post("/webhook", async (req, res) => {
   if (!isValidSignature(req)) return res.sendStatus(401);
 
-  try {
-    const entry  = req.body.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value  = change?.value;
+  // Responder a Meta **de inmediato** para no bloquear el webhook
+  res.status(200).end();
 
-    const product = (value?.messaging_product || "").toLowerCase();
-    if (product && product !== "whatsapp") {
-      console.log("Evento no-WhatsApp recibido; se ignora.");
-      return res.sendStatus(200);
-    }
+  // Procesar en background
+  setImmediate(async () => {
+    try {
+      const entry  = req.body.entry?.[0];
+      const change = entry?.changes?.[0];
+      const value  = change?.value;
 
-    const waMsg = value?.messages?.[0];
-    if (!waMsg) {
-      console.log("Sin messages[0]; nada que hacer.");
-      return res.sendStatus(200);
-    }
+      const product = (value?.messaging_product || "").toLowerCase();
+      if (product && product !== "whatsapp") return;
 
-    const referral  = waMsg?.referral || value?.referral || null;
-    const ctwaClid  = referral?.ctwa_clid || referral?.click_id || null;
-    const userPhone = waMsg?.from || null;
-    const ts        = unix(waMsg?.timestamp);
+      const waMsg = value?.messages?.[0];
+      if (!waMsg) return;
 
-    const payload = {
-      platform:       "whatsapp",
-      channel_source: referral ? "ctwa" : "whatsapp",
-      ctwa_clid:      ctwaClid,
-      campaign_id:    referral?.campaign_id || null,
-      adset_id:       referral?.adset_id    || null,
-      ad_id:          referral?.ad_id       || null,
-      first_message_unix: ts,
-      last_message_unix:  ts,
-      thread_id:      waMsg?.id || null,
-      entry_owner_id: entry?.id || null,
-      campaign_name:     null,
-      media_budget_hint: null,
-      deal_amount:       null,
-    };
+      const referral  = waMsg?.referral || value?.referral || null;
+      const ctwaClid  = referral?.ctwa_clid || referral?.click_id || null;
+      const userPhone = waMsg?.from || null;
+      const ts        = unix(waMsg?.timestamp);
 
-    // Completar con Ads si falta info (opcional)
-    const needAds = !payload.ad_id || !payload.adset_id || !payload.campaign_id || !payload.campaign_name;
-    if (needAds) {
-      const adsExtra = await enrichFromAds({
-        ad_id: payload.ad_id,
-        adset_id: payload.adset_id,
-        campaign_id: payload.campaign_id
-      });
-      for (const [k, v] of Object.entries(adsExtra)) {
-        if (!payload[k]) payload[k] = v; // no sobrescribe si ya venía
+      const payload = {
+        platform:       "whatsapp",
+        channel_source: referral ? "ctwa" : "whatsapp",
+        ctwa_clid:      ctwaClid,
+        campaign_id:    referral?.campaign_id || null,
+        adset_id:       referral?.adset_id    || null,
+        ad_id:          referral?.ad_id       || null,
+        first_message_unix: ts,
+        last_message_unix:  ts,
+        thread_id:      waMsg?.id || null,
+        entry_owner_id: entry?.id || null,
+        campaign_name:     null,
+        media_budget_hint: null,
+        deal_amount:       null,
+      };
+
+      // Completar con Ads si falta info (opcional)
+      const needAds = !payload.ad_id || !payload.adset_id || !payload.campaign_id || !payload.campaign_name;
+      if (needAds) {
+        const adsExtra = await enrichFromAds({
+          ad_id: payload.ad_id,
+          adset_id: payload.adset_id,
+          campaign_id: payload.campaign_id
+        });
+        for (const [k, v] of Object.entries(adsExtra)) {
+          if (!payload[k]) payload[k] = v; // no sobrescribe si ya venía
+        }
       }
+
+      console.log("=== INBOUND EVENT ===", new Date().toISOString());
+      console.log("platform:", payload.platform, "ctwa:", ctwaClid ? "sí" : "(no)");
+      console.log("phone (raw WA):", userPhone || "(desconocido)");
+
+      const okNow = await tryUpdateOnce({ payload, phoneE164: userPhone });
+      if (okNow) {
+        console.log("[OK] Lead actualizado de inmediato.");
+      } else {
+        const key = ctwaClid || (userPhone || "unknown");
+        scheduleAntiRace(key, payload, userPhone); // 5/10/15 (y fast-probe si activaste)
+      }
+    } catch (e) {
+      console.error("[WEBHOOK BG ERROR]", e);
     }
-
-    console.log("=== INBOUND EVENT ===", new Date().toISOString());
-    console.log("platform:", payload.platform, "ctwa:", ctwaClid ? "sí" : "(no)");
-    console.log("phone (raw WA):", userPhone || "(desconocido)");
-
-    const okNow = await tryUpdateOnce({ payload, phoneE164: userPhone });
-
-    if (okNow) {
-      console.log("[OK] Lead actualizado de inmediato.");
-    } else {
-      console.log("[DEFER] Sin match inmediato: activando anti-race a 5/10/15 min.");
-      const key = ctwaClid || (userPhone || "unknown");
-      scheduleAntiRace(key, payload, userPhone);
-    }
-
-    return res.sendStatus(200);
-  } catch (e) {
-    console.error("[WEBHOOK ERROR]", e);
-    return res.sendStatus(500);
-  }
+  });
 });
 
 /* ================= START ================= */
