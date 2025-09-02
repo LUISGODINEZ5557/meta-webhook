@@ -1,88 +1,41 @@
-// server.js — Meta Webhook + Kommo (LLT: sin refresh), write-once,
-// respuesta inmediata, retries 5/10/15 min (coalescencia),
-// fast-probe opcional y Ads enrichment opcional.
-// Mejora: búsqueda por teléfono robusta (MX 521→52) + fallback en /leads?query
-// + logs de conteo para diagnóstico.
+// server.js — Meta Webhook + Kommo (write-once, sin crear leads, con enriquecimiento CTWA)
 
 import express from "express";
 import bodyParser from "body-parser";
 import crypto from "crypto";
 
 const app = express();
-app.use(bodyParser.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
-/* ================= META ================= */
+// ===== Body raw para validar firma de Meta =====
+app.use(bodyParser.json({
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
+
+// ===== ENV META =====
 const VERIFY_TOKEN = (process.env.META_VERIFY_TOKEN || "").trim();
 const APP_SECRET   = process.env.META_APP_SECRET;
 
-/* ===== Graph API (Ads enrichment opcional) ===== */
-const GRAPH_VER  = process.env.META_GRAPH_VERSION || "v20.0";
-const GRAPH_BASE = `https://graph.facebook.com/${GRAPH_VER}`;
-const ADS_TOKEN  = process.env.META_ADS_TOKEN || null;
-
-async function graphGet(path, params = {}) {
-  if (!ADS_TOKEN) return null;
-  const qs  = new URLSearchParams({ access_token: ADS_TOKEN, ...params }).toString();
-  const url = `${GRAPH_BASE}${path}?${qs}`;
-  const r   = await fetch(url);
-  const txt = await r.text();
-  if (!r.ok) {
-    console.error("[ADS API ERROR]", r.status, txt);
-    throw new Error(`Graph ${r.status}: ${txt}`);
-  }
-  try { return JSON.parse(txt); } catch { return null; }
-}
-
-/** Completa campaign/adset/ad (y nombre campaña) usando el ID más específico disponible */
-async function enrichFromAds(ref = {}) {
-  if (!ADS_TOKEN) return {};
-  const out = {};
-  try {
-    if (ref.ad_id) {
-      const ad = await graphGet(`/${ref.ad_id}`, {
-        fields: "id,name,adset_id,campaign_id,adset{name},campaign{name}"
-      });
-      if (ad?.id) out.ad_id = ad.id;
-      if (ad?.adset_id) out.adset_id = ad.adset_id;
-      if (ad?.campaign_id) out.campaign_id = ad.campaign_id;
-      out.campaign_name = ad?.campaign?.name || out.campaign_name || null;
-    } else if (ref.adset_id) {
-      const adset = await graphGet(`/${ref.adset_id}`, {
-        fields: "id,name,campaign_id,campaign{name}"
-      });
-      if (adset?.id) out.adset_id = adset.id;
-      if (adset?.campaign_id) out.campaign_id = adset.campaign_id;
-      out.campaign_name = adset?.campaign?.name || out.campaign_name || null;
-    } else if (ref.campaign_id) {
-      const camp = await graphGet(`/${ref.campaign_id}`, { fields: "id,name" });
-      if (camp?.id) out.campaign_id = camp.id;
-      out.campaign_name = camp?.name || out.campaign_name || null;
-    }
-  } catch (e) {
-    console.error("[ADS ENRICH ERROR]", e.message || e);
-  }
-  for (const k of Object.keys(out)) {
-    if (out[k] === null || out[k] === undefined || out[k] === "") delete out[k];
-  }
-  return out;
-}
-
-/* ================= KOMMO (LLT: sin refresh) ================= */
+// ===== ENV KOMMO =====
 const KOMMO = {
   base: (process.env.KOMMO_BASE || "").replace(/\/+$/, ""),
-  accessToken: process.env.KOMMO_ACCESS_TOKEN || "", // token de larga duración
+  clientId: process.env.KOMMO_CLIENT_ID,
+  clientSecret: process.env.KOMMO_CLIENT_SECRET,
+  redirectUri: process.env.KOMMO_REDIRECT_URI,
+  accessToken: process.env.KOMMO_ACCESS_TOKEN || null,   // si usas token largo, déjalo aquí
+  refreshToken: process.env.KOMMO_REFRESH_TOKEN || null, // si no usas refresh, puede ir vacío
 };
 
-/* ================= RETRIES ANTI-RACE ================= */
-const ANTI_RACE = { enabled: true, delayMs: 5 * 60 * 1000, attempts: 3 };
-const FAST_PROBE = process.env.FAST_PROBE === "1";
-const pendingRetries = new Map(); // key -> { timer, attempt }
+// ===== ENV MARKETING API (resolver CTWA -> ad/adset/campaign) =====
+const FB_SYS_TOKEN   = process.env.FB_SYS_TOKEN || "";        // token de usuario de sistema con ads_read/ads_management + business_management
+const FB_BUSINESS_ID = process.env.FB_BUSINESS_ID || "";      // Business Manager ID (opción A)
+const FB_AD_ACCOUNT  = process.env.FB_AD_ACCOUNT_ID || "";    // act_<ID> (opción B)
+const FB_VER         = process.env.FB_API_VERSION || "v21.0"; // versión de Graph
 
-/* ================= DIAGNÓSTICO ================= */
+// ===== Diagnóstico =====
 app.get("/",  (_, res) => res.status(200).send("up"));
 app.get("/health", (_, res) => res.status(200).send("ok"));
 
-/* ================= VERIFY (GET) ================= */
+// ===== Verificación GET del webhook =====
 app.get("/webhook", (req, res) => {
   const mode = (req.query["hub.mode"] || "").trim();
   const token = (req.query["hub.verify_token"] || "").trim();
@@ -97,75 +50,94 @@ app.get("/webhook", (req, res) => {
   return res.sendStatus(403);
 });
 
-/* ================= HMAC (POST) ================= */
+// ===== Firma HMAC (POST) =====
 function isValidSignature(req) {
-  if (!APP_SECRET) return true; // pruebas
+  if (!APP_SECRET) return true; // sólo para pruebas
   const received = req.get("x-hub-signature-256") || "";
   const expected = "sha256=" +
     crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
-  if (!received) { console.error("[HMAC] faltó header x-hub-signature-256"); return false; }
-  if (received.length !== expected.length) {
-    console.error("[HMAC] len mismatch. recv:", received.slice(0,15), "... exp:", expected.slice(0,15), "...");
-    return false;
-  }
+  if (received.length !== expected.length) return false;
+  try { return crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected)); }
+  catch { return false; }
+}
+
+// ===== Kommo OAuth callback (opcional) =====
+app.get("/kommo/oauth/callback", async (req, res) => {
   try {
-    const ok = crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
-    if (!ok) console.error("[HMAC] firma inválida. recv:", received.slice(0,30), " exp:", expected.slice(0,30));
-    return ok;
-  } catch (e) {
-    console.error("[HMAC ERROR]", e.message||e);
-    return false;
-  }
-}
-
-/* ================= KOMMO REQUEST (LLT; con backoff) ================= */
-function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-async function kommoRequest(path, options = {}) {
-  const url = `${KOMMO.base}${path}`;
-  let attempt = 0;
-  let delay = 1000;
-
-  while (true) {
-    attempt++;
-    const started = Date.now();
-    const r = await fetch(url, {
-      ...options,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${KOMMO.accessToken}`,
-        "User-Agent": "meta-webhook-kommo/LLT-1.1",
-        ...(options.headers || {}),
-      },
+    const code = req.query.code;
+    const r = await fetch(`${KOMMO.base}/oauth2/access_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: KOMMO.clientId,
+        client_secret: KOMMO.clientSecret,
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: KOMMO.redirectUri,
+      }),
     });
-    const ms = Date.now() - started;
+    const data = await r.json();
+    if (!r.ok) return res.status(400).send(data);
 
-    if (r.status === 401) {
-      const t = await r.text().catch(() => "");
-      console.error(`Kommo 401 (token inválido/expirado). Reemplaza KOMMO_ACCESS_TOKEN. Resp: ${t}`);
-      throw new Error(`Kommo 401: ${t}`);
-    }
-
-    if ((r.status === 429 || (r.status >= 500 && r.status <= 599)) && attempt <= 5) {
-      const retryAfter = Number(r.headers.get("Retry-After")) || 0;
-      const wait = Math.max(retryAfter * 1000, delay);
-      console.warn(`Kommo ${r.status} ${url} (${ms}ms). Retry #${attempt} in ${wait}ms`);
-      await sleep(wait);
-      delay = Math.min(delay * 2, 30_000);
-      continue;
-    }
-
-    if (!r.ok) {
-      const t = await r.text().catch(() => "");
-      console.error(`Kommo ${r.status} ${url} (${ms}ms)::`, t);
-      throw new Error(`Kommo ${r.status}: ${t}`);
-    }
-
-    try { return await r.json(); } catch { return null; }
+    KOMMO.accessToken  = data.access_token;
+    KOMMO.refreshToken = data.refresh_token;
+    console.log("KOMMO TOKENS (copia en Render y redeploy):", {
+      access_token: KOMMO.accessToken,
+      refresh_token: KOMMO.refreshToken,
+    });
+    return res.status(200).send("OK. Copia tokens desde logs a Environment y redepliega.");
+  } catch (e) {
+    console.error("OAuth callback error:", e);
+    return res.sendStatus(500);
   }
+});
+
+// ===== Kommo helpers =====
+async function kommoRefresh() {
+  if (!KOMMO.refreshToken) return; // si no usas refresh, sal
+  const r = await fetch(`${KOMMO.base}/oauth2/access_token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: KOMMO.clientId,
+      client_secret: KOMMO.clientSecret,
+      grant_type: "refresh_token",
+      refresh_token: KOMMO.refreshToken,
+      redirect_uri: KOMMO.redirectUri,
+    }),
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(`Refresh failed: ${JSON.stringify(data)}`);
+  KOMMO.accessToken  = data.access_token;
+  KOMMO.refreshToken = data.refresh_token;
+  console.log("KOMMO TOKENS REFRESHED");
 }
 
-/* ================= CAMPOS (IDs Kommo) ================= */
+async function kommoRequest(path, options = {}, retry = true) {
+  const url = `${KOMMO.base}${path}`;
+  const r = await fetch(url, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${KOMMO.accessToken}`,
+      "User-Agent": "meta-webhook-kommo/1.2",
+      ...(options.headers || {}),
+    },
+  });
+  if (r.status === 401 && retry && KOMMO.refreshToken) {
+    console.warn("401 en Kommo. Intentando refresh...");
+    await kommoRefresh();
+    return kommoRequest(path, options, false);
+  }
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    console.error(`Kommo ${r.status} ${url} ::`, t);
+    throw new Error(`Kommo ${r.status}: ${t}`);
+  }
+  try { return await r.json(); } catch { return null; }
+}
+
+// ===== IDs de campos personalizados (lead) =====
 const FIELDS = {
   LEAD: {
     CTWA_CLID:          2097583,
@@ -184,40 +156,35 @@ const FIELDS = {
   }
 };
 
-/* ================= HELPERS ================= */
+// ===== Utilidades =====
 const unix = (ts) => (ts ? Number(ts) : null);
 const num  = (v) => (v == null || v === "" ? null : Number(v) || null);
 const asArray = (v) => Array.isArray(v) ? v : [];
+const isNonEmpty = (v) => v !== null && v !== undefined && v !== "";
 
-/** Normalización robusta de teléfono (MX incluido: 521→52) */
-function phoneCandidates(raw) {
-  if (!raw) return [];
-  const digits = String(raw).replace(/\D+/g, "");
-  const cands = new Set();
+// Map anti-race para reintentos diferidos (por teléfono y por clid)
+const retryQueue = new Map(); // key -> timeoutId
 
-  // Base
-  cands.add(digits);          // 5216144947274
-  cands.add("+" + digits);    // +5216144947274
+function scheduleRetry(key, fn, attempt) {
+  // 1->5min, 2->10min, 3->15min
+  const delays = [0, 5, 10, 15]; // índice por attempt
+  if (attempt > 3) return;
 
-  // MX: si arranca con 521, agrega 52 (sin '1')
-  if (digits.startsWith("521") && digits.length >= 12) {
-    const mx52 = "52" + digits.slice(3); // 526144947274
-    cands.add(mx52);
-    cands.add("+" + mx52);
-    cands.add("00" + mx52);   // 00526144947274 (algunos CRMs europeos)
+  if (retryQueue.has(key)) {
+    console.log("[ANTI-RACE] Ya hay un intento programado para", key, "; omito duplicar.");
+    return;
   }
-
-  // últimos 10: 6144947274, +52 + últimos 10, y 52 + últimos 10 (sin '+')
-  if (digits.length >= 10) {
-    const last10 = digits.slice(-10);
-    cands.add(last10);
-    cands.add("+52" + last10);
-    cands.add("52" + last10);
-  }
-
-  return Array.from(cands);
+  const delayMin = delays[attempt];
+  const ms = delayMin * 60 * 1000;
+  console.log(`[ANTI-RACE] Intento #${attempt} para ${key} en ${delayMin} min`);
+  const t = setTimeout(async () => {
+    retryQueue.delete(key);
+    await fn(attempt);
+  }, ms);
+  retryQueue.set(key, t);
 }
 
+// ===== Transformadores de CFV =====
 function cfvToMap(custom_fields_values) {
   const m = new Map();
   for (const cf of asArray(custom_fields_values)) {
@@ -230,8 +197,7 @@ function cfvToMap(custom_fields_values) {
 
 function leadCFV(p) {
   const out = [];
-  const add = (id, v) => (v !== null && v !== undefined && v !== "") &&
-    out.push({ field_id: id, values: [{ value: v }] });
+  const add = (id, v) => isNonEmpty(v) && out.push({ field_id: id, values: [{ value: v }] });
   add(FIELDS.LEAD.CTWA_CLID,          p.ctwa_clid);
   add(FIELDS.LEAD.CAMPAIGN_ID,        p.campaign_id);
   add(FIELDS.LEAD.ADSET_ID,           p.adset_id);
@@ -253,8 +219,9 @@ function mergeAttribution(existingCFV = [], incomingPayload) {
   const out = { ...incomingPayload };
   const keep = (fid, key) => {
     const have = m.get(fid);
-    if (have != null && have !== "") out[key] = have;
+    if (isNonEmpty(have)) out[key] = have;
   };
+  // Campos write-once (atribución)
   keep(FIELDS.LEAD.CTWA_CLID,      "ctwa_clid");
   keep(FIELDS.LEAD.CAMPAIGN_ID,    "campaign_id");
   keep(FIELDS.LEAD.ADSET_ID,       "adset_id");
@@ -262,6 +229,7 @@ function mergeAttribution(existingCFV = [], incomingPayload) {
   keep(FIELDS.LEAD.PLATFORM,       "platform");
   keep(FIELDS.LEAD.CHANNEL_SOURCE, "channel_source");
 
+  // Timestamps coherentes
   const firstOld = num(m.get(FIELDS.LEAD.FIRST_TS));
   const lastOld  = num(m.get(FIELDS.LEAD.LAST_TS));
   const firstNew = num(incomingPayload.first_message_unix);
@@ -278,19 +246,43 @@ function mergeAttribution(existingCFV = [], incomingPayload) {
   return out;
 }
 
-/* ================= LECTURA / UPDATE EN KOMMO ================= */
+// ===== Normalización de teléfono =====
+function phoneCandidates(raw) {
+  if (!raw) return [];
+  const digits = String(raw).replace(/\D+/g, "");
+  const cands = new Set();
+
+  // variantes e164 y locales MX (+ ajusta si tu país es otro)
+  cands.add(digits);                 // 5213312345678
+  cands.add("+" + digits);           // +5213312345678
+  cands.add("52" + digits.replace(/^52/, "")); // asegurar prefijo país MX
+  cands.add("+52" + digits.replace(/^52/, ""));
+  cands.add("0052" + digits.replace(/^52/, ""));
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    cands.add(last10);               // 3312345678
+  }
+  return Array.from(cands);
+}
+
+// ===== Kommo: lectura/actualización =====
 async function getLeadById(id) {
   if (!id) return null;
-  try { return await kommoRequest(`/api/v4/leads/${id}`, { method: "GET" }); }
-  catch (e) { console.error("getLeadById error:", e.message || e); return null; }
+  try {
+    return await kommoRequest(`/api/v4/leads/${id}`, { method: "GET" });
+  } catch (e) {
+    console.error("getLeadById error:", e.message || e);
+    return null;
+  }
 }
 
 async function findLeadByCtwa(clid) {
   if (!clid) return null;
+  // 1) query global
   const q = encodeURIComponent(clid);
   const res = await kommoRequest(`/api/v4/leads?query=${q}&limit=25`, { method: "GET" });
   const leads = res?._embedded?.leads || [];
-  console.log(`[SEARCH] leads?query=CTWA got ${leads.length}`);
+  console.log("[SEARCH] leads?query=CTWA got", leads.length);
   const match = leads.find(l =>
     asArray(l.custom_fields_values).some(cf => cf.field_id === FIELDS.LEAD.CTWA_CLID &&
       cf.values?.[0]?.value === clid)
@@ -305,52 +297,46 @@ async function findLeadByPhone(rawPhone) {
   if (!tries.length) return null;
 
   console.log("[PHONE MATCH] Probar variantes:", tries.join(", "));
+  // 2) primero prueba por contactos (con with=leads)
   for (const qRaw of tries) {
     const q = encodeURIComponent(qRaw);
     try {
       const res = await kommoRequest(`/api/v4/contacts?query=${q}&limit=10`, { method: "GET" });
       const contacts = res?._embedded?.contacts || [];
       console.log(`[SEARCH] contacts?query=${qRaw} -> ${contacts.length}`);
-      const contact = contacts[0];
-      if (!contact) continue;
-
-      const det = await kommoRequest(`/api/v4/contacts/${contact.id}?with=leads`, { method: "GET" });
-      const leads = det?._embedded?.leads || [];
-      console.log(`[SEARCH] contact ${contact.id} leads -> ${leads.length}`);
-      if (!leads.length) continue;
-
-      leads.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
-      const latest = leads[0];
-      const full = await getLeadById(latest.id);
-      console.log("[PHONE MATCH] Encontrado contacto", contact.id, "lead", latest.id);
-      return full || latest;
+      for (const c of contacts) {
+        const det = await kommoRequest(`/api/v4/contacts/${c.id}?with=leads`, { method: "GET" });
+        const leads = det?._embedded?.leads || [];
+        console.log(`[SEARCH] contact ${c.id} leads -> ${leads.length}`);
+        if (!leads.length) continue;
+        leads.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
+        const latest = leads[0];
+        const full = await getLeadById(latest.id);
+        return full || latest;
+      }
     } catch (e) {
-      console.warn("Búsqueda por teléfono falló con", qRaw, "->", e.message || e);
+      console.warn("Búsqueda por teléfono (contacts) falló con", qRaw, "->", e.message || e);
     }
   }
-  return null;
-}
 
-/** NUEVO: fallback directo a /leads?query=tel por si el teléfono no está aún en el Contact */
-async function findLeadByPhoneInLeads(rawPhone) {
-  const tries = phoneCandidates(rawPhone);
+  // 3) si aún nada: prueba por leads?query=tel (algunas veces indexa primero el lead)
   for (const qRaw of tries) {
     const q = encodeURIComponent(qRaw);
     try {
-      const res = await kommoRequest(`/api/v4/leads?query=${q}&limit=25`, { method: "GET" });
+      const res = await kommoRequest(`/api/v4/leads?query=${q}&limit=10`, { method: "GET" });
       const leads = res?._embedded?.leads || [];
       console.log(`[SEARCH] leads?query=${qRaw} -> ${leads.length}`);
-      if (!leads.length) continue;
-      leads.sort((a,b)=>(b.updated_at||0)-(a.updated_at||0));
-      const full = await getLeadById(leads[0].id);
-      if (full) {
-        console.log("[PHONE->LEADS] match lead", full.id, "con query", qRaw);
-        return full;
+      if (leads.length) {
+        const lead = leads[0];
+        console.log("[PHONE->LEADS] match lead", lead.id, "con query", qRaw);
+        const full = await getLeadById(lead.id);
+        return full || lead;
       }
     } catch (e) {
-      console.warn("[PHONE->LEADS] fallo con", qRaw, "->", e.message||e);
+      console.warn("Búsqueda por teléfono (leads) falló con", qRaw, "->", e.message || e);
     }
   }
+
   return null;
 }
 
@@ -362,157 +348,175 @@ async function updateLeadCFV(leadId, payload) {
   console.log("[PATCH OK] lead", leadId);
 }
 
-/* ===== Intento único de update (sin crear) ===== */
-async function tryUpdateOnce({ payload, phoneE164 }) {
+// ===== Marketing API: resolver CTWA -> IDs de anuncio (write-once) =====
+async function resolveCtwaAdIds(ctwaClid) {
+  if (!ctwaClid || !FB_SYS_TOKEN) {
+    console.log("[CTWA RESOLVER] omitido (faltan TOKEN/CLID)");
+    return null;
+  }
+  try {
+    // Opción A: por negocio
+    let url = `https://graph.facebook.com/${FB_VER}/${FB_BUSINESS_ID}/ctwa_clicks` +
+      `?ctwa_click_id=${encodeURIComponent(ctwaClid)}` +
+      `&fields=ad_id,adset_id,campaign_id,campaign_name,ad_name,adset_name` +
+      `&access_token=${encodeURIComponent(FB_SYS_TOKEN)}`;
+    let r = await fetch(url);
+
+    // Fallback Opción B: por cuenta publicitaria
+    if ((!r.ok || r.status === 400 || r.status === 404) && FB_AD_ACCOUNT) {
+      url = `https://graph.facebook.com/${FB_VER}/${FB_AD_ACCOUNT}/ctwa_clicks` +
+        `?ctwa_click_id=${encodeURIComponent(ctwaClid)}` +
+        `&fields=ad_id,adset_id,campaign_id,campaign_name,ad_name,adset_name` +
+        `&access_token=${encodeURIComponent(FB_SYS_TOKEN)}`;
+      r = await fetch(url);
+    }
+
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      console.warn("[CTWA RESOLVER] fallo:", r.status, t);
+      return null;
+    }
+    const data = await r.json();
+    const item = Array.isArray(data?.data) ? data.data[0] : data;
+    if (!item) return null;
+
+    return {
+      ad_id:         item.ad_id || null,
+      adset_id:      item.adset_id || null,
+      campaign_id:   item.campaign_id || null,
+      campaign_name: item.campaign_name || null,
+    };
+  } catch (e) {
+    console.warn("[CTWA RESOLVER] error:", e.message || e);
+    return null;
+  }
+}
+
+// ===== Lógica principal: actualizar si existe (no crear) =====
+async function updateExistingLead({ payload, phoneE164 }) {
   let lead = null;
 
+  // 1) por CTWA
   if (payload.ctwa_clid) {
     lead = await findLeadByCtwa(payload.ctwa_clid);
     if (lead) console.log("[MATCH] por CTWA en lead", lead.id);
   }
 
+  // 2) por teléfono (contacts y luego leads)
   if (!lead && phoneE164) {
-    lead = await findLeadByPhone(phoneE164); // via contacts
-    if (lead) console.log("[MATCH] por teléfono (contacts) en lead", lead.id);
-  }
-
-  if (!lead && phoneE164) {
-    lead = await findLeadByPhoneInLeads(phoneE164); // NUEVO fallback directo en leads
-    if (lead) console.log("[MATCH] por teléfono (leads?query) en lead", lead.id);
+    lead = await findLeadByPhone(phoneE164);
+    if (lead) console.log("[MATCH] por teléfono en lead", lead.id);
   }
 
   if (!lead) {
     console.log("[NO MATCH] Aún no existe lead/contacto en Kommo.");
-    return false;
+    return { updated: false, leadId: null };
+  }
+
+  // Enriquecimiento write-once: si tenemos CTWA y faltan IDs, intenta completarlos
+  if (payload.ctwa_clid && (!payload.campaign_id || !payload.adset_id || !payload.ad_id)) {
+    const metaIds = await resolveCtwaAdIds(payload.ctwa_clid);
+    if (metaIds) {
+      payload.campaign_id   = payload.campaign_id || metaIds.campaign_id || null;
+      payload.adset_id      = payload.adset_id    || metaIds.adset_id    || null;
+      payload.ad_id         = payload.ad_id       || metaIds.ad_id       || null;
+      payload.campaign_name = payload.campaign_name || metaIds.campaign_name || null;
+      console.log("[CTWA RESOLVER] completado:", metaIds);
+    }
   }
 
   const merged = mergeAttribution(lead.custom_fields_values, payload);
   await updateLeadCFV(lead.id, merged);
-  return true;
+  return { updated: true, leadId: lead.id };
 }
 
-/* ===== Programación de reintentos a 5/10/15 min con coalescencia + fast-probe opcional ===== */
-function scheduleAntiRace(key, payload, phoneE164) {
-  if (!ANTI_RACE.enabled) return;
-
-  const existing = pendingRetries.get(key);
-  if (existing?.timer) {
-    console.log(`[ANTI-RACE] Ya hay un intento programado para ${key}; omito duplicar.`);
-    return;
-  }
-
-  if (FAST_PROBE) {
-    const t20 = setTimeout(async () => {
-      pendingRetries.delete(key);
-      try {
-        const ok = await tryUpdateOnce({ payload, phoneE164 });
-        if (ok) { console.log(`[FAST_PROBE] Éxito para ${key}`); return; }
-      } catch (e) {
-        console.warn("[FAST_PROBE ERROR]", e.message || e);
-      }
-      _scheduleSeries(key, payload, phoneE164, 1); // 5/10/15
-    }, 20_000);
-    pendingRetries.set(key, { timer: t20, attempt: 0 });
-    return;
-  }
-
-  _scheduleSeries(key, payload, phoneE164, 1);
-}
-
-function _scheduleSeries(key, payload, phoneE164, attempt) {
-  if (attempt > ANTI_RACE.attempts) {
-    pendingRetries.delete(key);
-    console.warn(`[ANTI-RACE] Abandonado ${key} tras ${attempt - 1} intentos`);
-    return;
-  }
-  const delay = ANTI_RACE.delayMs; // 5 min
-  console.log(`[ANTI-RACE] Intento #${attempt} para ${key} en ${Math.round(delay/60000)} min`);
-  const timer = setTimeout(async () => {
-    pendingRetries.delete(key);
-    try {
-      const ok = await tryUpdateOnce({ payload, phoneE164 });
-      if (!ok) _scheduleSeries(key, payload, phoneE164, attempt + 1);
-      else console.log(`[ANTI-RACE] Actualización lograda para ${key} en intento #${attempt}`);
-    } catch (e) {
-      console.error("[ANTI-RACE ERROR]", e.message || e);
-      _scheduleSeries(key, payload, phoneE164, attempt + 1);
-    }
-  }, delay);
-  pendingRetries.set(key, { timer, attempt });
-}
-
-/* ================= WEBHOOK (POST) — Respuesta inmediata ================= */
+// ===== Webhook POST =====
 app.post("/webhook", async (req, res) => {
   if (!isValidSignature(req)) return res.sendStatus(401);
 
-  // Responder a Meta **de inmediato** para no bloquear el webhook
-  res.status(200).end();
+  try {
+    const entry  = req.body.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value  = change?.value;
 
-  // Procesar en background
-  setImmediate(async () => {
-    try {
-      const entry  = req.body.entry?.[0];
-      const change = entry?.changes?.[0];
-      const value  = change?.value;
-
-      const product = (value?.messaging_product || "").toLowerCase();
-      if (product && product !== "whatsapp") return; // por ahora WA-only
-
-      const waMsg = value?.messages?.[0];
-      if (!waMsg) return;
-
-      const referral  = waMsg?.referral || value?.referral || null;
-      const ctwaClid  = referral?.ctwa_clid || referral?.click_id || null;
-      const userPhone = waMsg?.from || null; // MSISDN
-      const ts        = unix(waMsg?.timestamp);
-
-      const payload = {
-        platform:       "whatsapp",
-        channel_source: referral ? "ctwa" : "whatsapp",
-        ctwa_clid:      ctwaClid,
-        campaign_id:    referral?.campaign_id || null,
-        adset_id:       referral?.adset_id    || null,
-        ad_id:          referral?.ad_id       || null,
-        first_message_unix: ts,
-        last_message_unix:  ts,
-        thread_id:      waMsg?.id || null,
-        entry_owner_id: entry?.id || null,
-        campaign_name:     null,
-        media_budget_hint: null,
-        deal_amount:       null,
-      };
-
-      // Completar con Ads si falta info (opcional)
-      const needAds = !payload.ad_id || !payload.adset_id || !payload.campaign_id || !payload.campaign_name;
-      if (needAds) {
-        const adsExtra = await enrichFromAds({
-          ad_id: payload.ad_id,
-          adset_id: payload.adset_id,
-          campaign_id: payload.campaign_id
-        });
-        for (const [k, v] of Object.entries(adsExtra)) {
-          if (!payload[k]) payload[k] = v; // no sobrescribe si ya venía
-        }
-      }
-
-      console.log("=== INBOUND EVENT ===", new Date().toISOString());
-      console.log("platform:", payload.platform, "ctwa:", ctwaClid ? "sí" : "(no)");
-      console.log("phone (raw WA):", userPhone || "(desconocido)");
-
-      const okNow = await tryUpdateOnce({ payload, phoneE164: userPhone });
-      if (okNow) {
-        console.log("[OK] Lead actualizado de inmediato.");
-      } else {
-        const key = ctwaClid || (userPhone || "unknown");
-        scheduleAntiRace(key, payload, userPhone); // 5/10/15 (y fast-probe si activaste)
-      }
-    } catch (e) {
-      console.error("[WEBHOOK BG ERROR]", e);
+    const product = (value?.messaging_product || "").toLowerCase();
+    if (product && product !== "whatsapp") {
+      console.log("Evento no-WhatsApp recibido; se ignora.");
+      return res.sendStatus(200);
     }
-  });
+
+    const waMsg = value?.messages?.[0];
+    if (!waMsg) {
+      console.log("Sin messages[0]; nada que hacer.");
+      return res.sendStatus(200);
+    }
+
+    const referral  = waMsg?.referral || value?.referral || null;
+    const ctwaClid  = referral?.ctwa_clid || referral?.click_id || null;
+    const userPhone = waMsg?.from || null;
+    const ts        = unix(waMsg?.timestamp);
+
+    const payload = {
+      platform:       "whatsapp",
+      channel_source: referral ? "ctwa" : "whatsapp",
+      ctwa_clid:      ctwaClid,
+      campaign_id:    referral?.campaign_id || null, // normalmente Meta no lo manda en WA
+      adset_id:       referral?.adset_id    || null,
+      ad_id:          referral?.ad_id       || null,
+
+      first_message_unix: ts,
+      last_message_unix:  ts,
+      thread_id:      waMsg?.id || null,
+      entry_owner_id: entry?.id || null,
+
+      // opcionales
+      campaign_name:     null,
+      media_budget_hint: null,
+      deal_amount:       null,
+    };
+
+    console.log("=== INBOUND EVENT ===", new Date().toISOString());
+    console.log("platform:", payload.platform, "ctwa:", ctwaClid ? "sí" : "(no)");
+    console.log("phone (raw WA):", userPhone || "(desconocido)");
+
+    // Intento inmediato
+    const attemptOnce = async (attempt) => {
+      const { updated, leadId } = await updateExistingLead({ payload, phoneE164: userPhone });
+      if (updated) {
+        console.log(`[ANTI-RACE] Actualización lograda para ${ctwaClid || userPhone} en intento #${attempt}`);
+        return true;
+      }
+      return false;
+    };
+
+    const okNow = await attemptOnce(0);
+    if (!okNow) {
+      // Programar reintentos 5/10/15
+      const keyPhone = userPhone || "";
+      const keyClid  = ctwaClid   || "";
+
+      if (keyClid) {
+        scheduleRetry(keyClid, async (n) => {
+          const done = await attemptOnce(n);
+          if (!done && n < 3) scheduleRetry(keyClid, arguments.callee, n + 1);
+        }, 1);
+      }
+      if (keyPhone) {
+        scheduleRetry(keyPhone, async (n) => {
+          const done = await attemptOnce(n);
+          if (!done && n < 3) scheduleRetry(keyPhone, arguments.callee, n + 1);
+        }, 1);
+      }
+    }
+
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("[WEBHOOK ERROR]", e);
+    return res.sendStatus(500);
+  }
 });
 
-/* ================= START ================= */
+// ===== Start =====
 app.listen(process.env.PORT || 3000, () => {
   console.log("Webhook escuchando...");
 });
