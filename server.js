@@ -1,5 +1,8 @@
-// server.js — Meta Webhook + Kommo (LLT: sin refresh), write-once, respuesta inmediata,
-// retries 5/10/15 min (coalescencia), fast-probe opcional y Ads enrichment opcional.
+// server.js — Meta Webhook + Kommo (LLT: sin refresh), write-once,
+// respuesta inmediata, retries 5/10/15 min (coalescencia),
+// fast-probe opcional y Ads enrichment opcional.
+// Mejora: búsqueda por teléfono robusta (MX 521→52) + fallback en /leads?query
+// + logs de conteo para diagnóstico.
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -67,13 +70,10 @@ async function enrichFromAds(ref = {}) {
 /* ================= KOMMO (LLT: sin refresh) ================= */
 const KOMMO = {
   base: (process.env.KOMMO_BASE || "").replace(/\/+$/, ""),
-  accessToken: process.env.KOMMO_ACCESS_TOKEN || "", // ← token de larga duración
+  accessToken: process.env.KOMMO_ACCESS_TOKEN || "", // token de larga duración
 };
 
-/* ================= RETRIES ANTI-RACE =================
-   Reintentos a 5, 10 y 15 minutos si Kommo aún no creó el lead/contacto.
-   Coalescencia: 1 timer por key (ctwa o teléfono). Fast-probe opcional: 20s.
-======================================================= */
+/* ================= RETRIES ANTI-RACE ================= */
 const ANTI_RACE = { enabled: true, delayMs: 5 * 60 * 1000, attempts: 3 };
 const FAST_PROBE = process.env.FAST_PROBE === "1";
 const pendingRetries = new Map(); // key -> { timer, attempt }
@@ -103,12 +103,22 @@ function isValidSignature(req) {
   const received = req.get("x-hub-signature-256") || "";
   const expected = "sha256=" +
     crypto.createHmac("sha256", APP_SECRET).update(req.rawBody).digest("hex");
-  if (received.length !== expected.length) return false;
-  try { return crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected)); }
-  catch { return false; }
+  if (!received) { console.error("[HMAC] faltó header x-hub-signature-256"); return false; }
+  if (received.length !== expected.length) {
+    console.error("[HMAC] len mismatch. recv:", received.slice(0,15), "... exp:", expected.slice(0,15), "...");
+    return false;
+  }
+  try {
+    const ok = crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
+    if (!ok) console.error("[HMAC] firma inválida. recv:", received.slice(0,30), " exp:", expected.slice(0,30));
+    return ok;
+  } catch (e) {
+    console.error("[HMAC ERROR]", e.message||e);
+    return false;
+  }
 }
 
-/* ================= KOMMO REQUEST (sin refresh; con backoff) ================= */
+/* ================= KOMMO REQUEST (LLT; con backoff) ================= */
 function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 
 async function kommoRequest(path, options = {}) {
@@ -124,13 +134,12 @@ async function kommoRequest(path, options = {}) {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${KOMMO.accessToken}`,
-        "User-Agent": "meta-webhook-kommo/LLT-1.0",
+        "User-Agent": "meta-webhook-kommo/LLT-1.1",
         ...(options.headers || {}),
       },
     });
     const ms = Date.now() - started;
 
-    // LLT: no hay refresh. Si 401, avisamos y abortamos.
     if (r.status === 401) {
       const t = await r.text().catch(() => "");
       console.error(`Kommo 401 (token inválido/expirado). Reemplaza KOMMO_ACCESS_TOKEN. Resp: ${t}`);
@@ -179,6 +188,35 @@ const FIELDS = {
 const unix = (ts) => (ts ? Number(ts) : null);
 const num  = (v) => (v == null || v === "" ? null : Number(v) || null);
 const asArray = (v) => Array.isArray(v) ? v : [];
+
+/** Normalización robusta de teléfono (MX incluido: 521→52) */
+function phoneCandidates(raw) {
+  if (!raw) return [];
+  const digits = String(raw).replace(/\D+/g, "");
+  const cands = new Set();
+
+  // Base
+  cands.add(digits);          // 5216144947274
+  cands.add("+" + digits);    // +5216144947274
+
+  // MX: si arranca con 521, agrega 52 (sin '1')
+  if (digits.startsWith("521") && digits.length >= 12) {
+    const mx52 = "52" + digits.slice(3); // 526144947274
+    cands.add(mx52);
+    cands.add("+" + mx52);
+    cands.add("00" + mx52);   // 00526144947274 (algunos CRMs europeos)
+  }
+
+  // últimos 10: 6144947274, +52 + últimos 10, y 52 + últimos 10 (sin '+')
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    cands.add(last10);
+    cands.add("+52" + last10);
+    cands.add("52" + last10);
+  }
+
+  return Array.from(cands);
+}
 
 function cfvToMap(custom_fields_values) {
   const m = new Map();
@@ -240,21 +278,6 @@ function mergeAttribution(existingCFV = [], incomingPayload) {
   return out;
 }
 
-/* ===== Teléfono: normalización ===== */
-function phoneCandidates(raw) {
-  if (!raw) return [];
-  const digits = String(raw).replace(/\D+/g, "");
-  const cands = new Set();
-  cands.add(digits);
-  cands.add("+" + digits);
-  if (digits.length >= 10) {
-    const last10 = digits.slice(-10);
-    cands.add(last10);
-    cands.add("+52" + last10); // ajusta prefijo país si aplica
-  }
-  return Array.from(cands);
-}
-
 /* ================= LECTURA / UPDATE EN KOMMO ================= */
 async function getLeadById(id) {
   if (!id) return null;
@@ -267,6 +290,7 @@ async function findLeadByCtwa(clid) {
   const q = encodeURIComponent(clid);
   const res = await kommoRequest(`/api/v4/leads?query=${q}&limit=25`, { method: "GET" });
   const leads = res?._embedded?.leads || [];
+  console.log(`[SEARCH] leads?query=CTWA got ${leads.length}`);
   const match = leads.find(l =>
     asArray(l.custom_fields_values).some(cf => cf.field_id === FIELDS.LEAD.CTWA_CLID &&
       cf.values?.[0]?.value === clid)
@@ -285,11 +309,14 @@ async function findLeadByPhone(rawPhone) {
     const q = encodeURIComponent(qRaw);
     try {
       const res = await kommoRequest(`/api/v4/contacts?query=${q}&limit=10`, { method: "GET" });
-      const contact = res?._embedded?.contacts?.[0];
+      const contacts = res?._embedded?.contacts || [];
+      console.log(`[SEARCH] contacts?query=${qRaw} -> ${contacts.length}`);
+      const contact = contacts[0];
       if (!contact) continue;
 
       const det = await kommoRequest(`/api/v4/contacts/${contact.id}?with=leads`, { method: "GET" });
       const leads = det?._embedded?.leads || [];
+      console.log(`[SEARCH] contact ${contact.id} leads -> ${leads.length}`);
       if (!leads.length) continue;
 
       leads.sort((a, b) => (b.updated_at || 0) - (a.updated_at || 0));
@@ -299,6 +326,29 @@ async function findLeadByPhone(rawPhone) {
       return full || latest;
     } catch (e) {
       console.warn("Búsqueda por teléfono falló con", qRaw, "->", e.message || e);
+    }
+  }
+  return null;
+}
+
+/** NUEVO: fallback directo a /leads?query=tel por si el teléfono no está aún en el Contact */
+async function findLeadByPhoneInLeads(rawPhone) {
+  const tries = phoneCandidates(rawPhone);
+  for (const qRaw of tries) {
+    const q = encodeURIComponent(qRaw);
+    try {
+      const res = await kommoRequest(`/api/v4/leads?query=${q}&limit=25`, { method: "GET" });
+      const leads = res?._embedded?.leads || [];
+      console.log(`[SEARCH] leads?query=${qRaw} -> ${leads.length}`);
+      if (!leads.length) continue;
+      leads.sort((a,b)=>(b.updated_at||0)-(a.updated_at||0));
+      const full = await getLeadById(leads[0].id);
+      if (full) {
+        console.log("[PHONE->LEADS] match lead", full.id, "con query", qRaw);
+        return full;
+      }
+    } catch (e) {
+      console.warn("[PHONE->LEADS] fallo con", qRaw, "->", e.message||e);
     }
   }
   return null;
@@ -320,10 +370,17 @@ async function tryUpdateOnce({ payload, phoneE164 }) {
     lead = await findLeadByCtwa(payload.ctwa_clid);
     if (lead) console.log("[MATCH] por CTWA en lead", lead.id);
   }
+
   if (!lead && phoneE164) {
-    lead = await findLeadByPhone(phoneE164);
-    if (lead) console.log("[MATCH] por teléfono en lead", lead.id);
+    lead = await findLeadByPhone(phoneE164); // via contacts
+    if (lead) console.log("[MATCH] por teléfono (contacts) en lead", lead.id);
   }
+
+  if (!lead && phoneE164) {
+    lead = await findLeadByPhoneInLeads(phoneE164); // NUEVO fallback directo en leads
+    if (lead) console.log("[MATCH] por teléfono (leads?query) en lead", lead.id);
+  }
+
   if (!lead) {
     console.log("[NO MATCH] Aún no existe lead/contacto en Kommo.");
     return false;
@@ -399,14 +456,14 @@ app.post("/webhook", async (req, res) => {
       const value  = change?.value;
 
       const product = (value?.messaging_product || "").toLowerCase();
-      if (product && product !== "whatsapp") return;
+      if (product && product !== "whatsapp") return; // por ahora WA-only
 
       const waMsg = value?.messages?.[0];
       if (!waMsg) return;
 
       const referral  = waMsg?.referral || value?.referral || null;
       const ctwaClid  = referral?.ctwa_clid || referral?.click_id || null;
-      const userPhone = waMsg?.from || null;
+      const userPhone = waMsg?.from || null; // MSISDN
       const ts        = unix(waMsg?.timestamp);
 
       const payload = {
