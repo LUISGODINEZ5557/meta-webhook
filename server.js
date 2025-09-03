@@ -1,8 +1,10 @@
-// server.js — Meta Webhook + Kommo
-// Atribución write-once sin crear leads, anti-race, y enriquecimiento correcto:
-// 1) referral directo
-// 2) referral.source_url (URL parameters con macros {ad.id}, {adset.id}, {campaign.id})
-// 3) Marketing API solo si ya hay ad_id (opcional)
+// server.js — Meta Webhook + Kommo + SmartLinks (Estrategia A)
+// - SmartLinks por canal (/go/wa, /go/m, /go/ig) con tech/model e IDs de Ads
+// - Texto WA autogenerado por tecnología/modelo; fallback si no se reconoce
+// - Webhook WA: no crea leads; actualiza solo si existe (CTWA / teléfono / leads?query)
+// - Atribución write-once (no pisa valores ya guardados)
+// - Enriquecimiento: referral + source_url (+ opcional Marketing API si hay ad_id)
+// - Anti-race: reintentos 5/10/15 min
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -22,6 +24,11 @@ const META_ADS_TOKEN     = process.env.META_ADS_TOKEN || "";   // token de usuar
 const META_GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v20.0";
 const ENABLE_AD_RESOLVER = (process.env.ENABLE_AD_RESOLVER || "1") === "1"; // 1=habilitado si hay ad_id y token
 
+// ===== CANALES (SmartLinks) =====
+const WA_DEFAULT_PHONE   = (process.env.WA_DEFAULT_PHONE || "").replace(/\D+/g, ""); // ej 5213334949317
+const FB_PAGE_USERNAME   = process.env.FB_PAGE_USERNAME || process.env.FB_PAGE_ID || ""; // ej 'Tipgroupmedical'
+const IG_USERNAME        = (process.env.IG_USERNAME || "").replace(/^@/, ""); // ej 'tipgroupmedical'
+
 // ===== KOMMO =====
 const KOMMO = {
   base: (process.env.KOMMO_BASE || "").replace(/\/+$/, ""),
@@ -31,6 +38,12 @@ const KOMMO = {
   accessToken: process.env.KOMMO_ACCESS_TOKEN || null,
   refreshToken: process.env.KOMMO_REFRESH_TOKEN || null, // si usas token de larga duración, puede quedar vacío
 };
+
+// ===== CAMPOS PERSONALIZADOS (por ENV) =====
+const CF_TECH_ID        = Number(process.env.KOMMO_FIELD_TECH_ID || 0) || null;         // 2097641
+const CF_MODEL_ID       = Number(process.env.KOMMO_FIELD_MODEL_ID || 0) || null;        // 2097643
+const CF_SITE_SOURCE_ID = Number(process.env.KOMMO_FIELD_SITE_SOURCE_ID || 0) || null;  // 2097645
+const CF_PLACEMENT_ID   = Number(process.env.KOMMO_FIELD_PLACEMENT_ID || 0) || null;    // 2097647
 
 // ===== DIAGNÓSTICO =====
 app.get("/",  (_, res) => res.status(200).send("up"));
@@ -59,6 +72,231 @@ function isValidSignature(req) {
   catch { return false; }
 }
 
+// ===== Helpers genéricos =====
+const unix   = (ts) => (ts ? Number(ts) : null);
+const num    = (v) => (v == null || v === "" ? null : Number(v) || null);
+const asArr  = (v) => Array.isArray(v) ? v : [];
+const enc    = (s) => encodeURIComponent(String(s ?? ""));
+const dec    = (s) => decodeURIComponent(String(s ?? ""));
+
+// ===== Catálogo y normalización de Tecnología/Modelo =====
+const TECH_ALIASES = {
+  "depilacion": "depilacion", "depilación": "depilacion", "laser": "depilacion",
+  "reductivos": "reductivos", "reductivo": "reductivos",
+  "rejuvenecimiento": "rejuvenecimiento", "antiage": "rejuvenecimiento",
+  "eliminacion de pigmentos": "eliminacion_pigmentos", "eliminación de pigmentos": "eliminacion_pigmentos",
+  "despigmentacion": "eliminacion_pigmentos", "despigmentación": "eliminacion_pigmentos",
+  "cuidados de la piel": "cuidados_piel", "skin": "cuidados_piel",
+  "laser para venas": "laser_venas", "láser para venas": "laser_venas", "vascular": "laser_venas"
+};
+
+const MODEL_ALIASES = {
+  // Depilación
+  "stimmung 2": "stimmung2", "stimmung2": "stimmung2",
+  "stimmung 2 mini": "stimmung2mini", "stimmung2 mini": "stimmung2mini", "s2mini": "stimmung2mini",
+  "stimmung 3": "stimmung3", "stimmung3": "stimmung3",
+  "stimmung 3 dual": "stimmung3dual", "stimmung3 dual": "stimmung3dual", "s3dual": "stimmung3dual",
+  "stimmung 3 mini": "stimmung3mini", "stimmung3 mini": "stimmung3mini", "s3mini": "stimmung3mini",
+  "stimmung 4": "stimmung4", "stimmung4": "stimmung4", "s4": "stimmung4",
+  "stimmung 4 dual": "stimmung4dual", "stimmung4 dual": "stimmung4dual",
+  "stimmung max": "stimmungmax", "stimmungmax": "stimmungmax",
+  "stimmung yag": "stimmungyag", "stimmungyag": "stimmungyag",
+
+  // Reductivos
+  "steiger max": "steigermax",
+  "steiger max mini": "steigermaxmini",
+  "sonnen max": "sonnenmax",
+  "ice pro": "icepro",
+  "indeed": "indeed",
+
+  // Rejuvenecimiento
+  "frack mini": "frackmini",
+  "frack max": "frackmax",
+  "hifu": "hifu",
+  "heilung": "heilung",
+
+  // Eliminación de Pigmentos
+  "mond max": "mondmax",
+  "bleisten max": "bleistenmax",
+
+  // Cuidados de la piel
+  "hidrofacial 9 en 1": "hidrofacial9en1",
+  "lyzer pro": "lyzerpro",
+
+  // Láser para venas
+  "laser vascular": "laservascular", "láser vascular": "laservascular"
+};
+
+const CATALOG = {
+  depilacion: {
+    label: "Depilación",
+    models: {
+      stimmung2: "STIMMUNG 2",
+      stimmung2mini: "STIMMUNG 2 MINI",
+      stimmung3: "STIMMUNG 3",
+      stimmung3dual: "STIMMUNG 3 DUAL",
+      stimmung3mini: "STIMMUNG 3 MINI",
+      stimmung4: "STIMMUNG 4",
+      stimmung4dual: "STIMMUNG 4 DUAL",
+      stimmungmax: "STIMMUNG MAX",
+      stimmungyag: "STIMMUNG YAG",
+    }
+  },
+  reductivos: {
+    label: "Reductivos",
+    models: {
+      steigermax: "STEIGER MAX",
+      steigermaxmini: "STEIGER MAX MINI",
+      sonnenmax: "SONNEN MAX",
+      icepro: "ICE PRO",
+      indeed: "INDEED",
+    }
+  },
+  rejuvenecimiento: {
+    label: "Rejuvenecimiento",
+    models: {
+      frackmini: "FRACK MINI",
+      frackmax: "FRACK MAX",
+      hifu: "HIFU",
+      heilung: "HEILUNG",
+    }
+  },
+  eliminacion_pigmentos: {
+    label: "Eliminación de Pigmentos",
+    models: {
+      mondmax: "MOND MAX",
+      bleistenmax: "BLEISTEN MAX",
+    }
+  },
+  cuidados_piel: {
+    label: "Cuidados de la piel",
+    models: {
+      hidrofacial9en1: "HIDROFACIAL 9 EN 1",
+      lyzerpro: "LYZER PRO",
+    }
+  },
+  laser_venas: {
+    label: "Láser para venas",
+    models: {
+      laservascular: "Láser vascular",
+    }
+  }
+};
+
+const FALLBACK_WA_TEXT = "Me interesa mas informacion sobre aparatologia estetica de gama alta";
+
+// Normaliza strings a claves
+function norm(s){ return String(s || "").toLowerCase().trim(); }
+function toTechKey(s){
+  const n = norm(s);
+  return TECH_ALIASES[n] || (n in CATALOG ? n : null);
+}
+function toModelKey(s){
+  const n = norm(s).replace(/\s+/g, " ");
+  return MODEL_ALIASES[n] || null;
+}
+
+function pickLabel(techKey, modelKey){
+  const tech = techKey && CATALOG[techKey];
+  if (!tech) return { text: FALLBACK_WA_TEXT, label: null };
+  const modelLabel = modelKey && tech.models[modelKey];
+  if (modelLabel) {
+    return { text: `Hola, me interesa mas informacion del equipo de ${tech.label} ${modelLabel}.`, label: `${tech.label} ${modelLabel}` };
+  }
+  return { text: `Hola, me interesa mas informacion de ${tech.label}.`, label: tech.label };
+}
+
+// ===== SmartLinks (Estrategia A) =====
+function buildAttrRef(q) {
+  const allow = new Set([
+    "ad_id","adset_id","campaign_id",
+    "site_source","placement","campaign_name","ad_name","adset_name",
+    "tech","model","src",
+    "utm_source","utm_medium","utm_campaign"
+  ]);
+  const parts = [];
+  for (const [k, v] of Object.entries(q || {})) {
+    if (!allow.has(k)) continue;
+    if (v == null || v === "") continue;
+    parts.push(`${k}=${String(v)}`);
+  }
+  return parts.join("&");
+}
+
+// WA: texto + #ATTR con toda la atribución
+app.get("/go/wa", (req, res) => {
+  try {
+    const phone = (req.query.phone || WA_DEFAULT_PHONE || "").replace(/\D+/g, "");
+    if (!phone) return res.status(400).send("Falta phone (WA_DEFAULT_PHONE o ?phone=)");
+
+    const techKey  = toTechKey(req.query.tech);
+    const modelKey = toModelKey(req.query.model);
+
+    let text = req.query.text ? String(req.query.text) : pickLabel(techKey, modelKey).text;
+    const ref = buildAttrRef({
+      ...req.query,
+      tech: techKey || "",
+      model: modelKey || "",
+      src: req.query.src || "ctwa"
+    });
+    if (ref) text = `${text}\n#ATTR ${ref.replace(/&/g," ")}`;
+
+    const url = `https://wa.me/${phone}?text=${enc(text)}`;
+    return res.redirect(302, url);
+  } catch (e) {
+    console.error("Smartlink /go/wa error:", e);
+    return res.status(500).send("Error");
+  }
+});
+
+// Messenger: m.me/<page>?ref=...
+app.get("/go/m", (req, res) => {
+  try {
+    const page = FB_PAGE_USERNAME;
+    if (!page) return res.status(400).send("Configura FB_PAGE_USERNAME o FB_PAGE_ID");
+
+    const techKey  = toTechKey(req.query.tech);
+    const modelKey = toModelKey(req.query.model);
+
+    const ref = buildAttrRef({
+      ...req.query,
+      tech: techKey || "",
+      model: modelKey || "",
+      src: req.query.src || "ctm"
+    }) || "src=ctm";
+
+    const url = `https://m.me/${enc(page)}?ref=${enc(ref)}`;
+    return res.redirect(302, url);
+  } catch (e) {
+    console.error("Smartlink /go/m error:", e);
+    return res.status(500).send("Error");
+  }
+});
+
+// Instagram DM: ig.me/<user>?ref=...
+app.get("/go/ig", (req, res) => {
+  try {
+    const ig = IG_USERNAME;
+    if (!ig) return res.status(400).send("Configura IG_USERNAME");
+
+    const techKey  = toTechKey(req.query.tech);
+    const modelKey = toModelKey(req.query.model);
+
+    const ref = buildAttrRef({
+      ...req.query,
+      tech: techKey || "",
+      model: modelKey || "",
+      src: req.query.src || "ctd"
+    }) || "src=ctd";
+
+    const url = `https://ig.me/${enc(ig)}?ref=${enc(ref)}`;
+    return res.redirect(302, url);
+  } catch (e) {
+    console.error("Smartlink /go/ig error:", e);
+    return res.status(500).send("Error");
+  }
+});
+
 // ===== KOMMO helpers =====
 async function kommoRequest(path, options = {}) {
   const url = `${KOMMO.base}${path}`;
@@ -67,7 +305,7 @@ async function kommoRequest(path, options = {}) {
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${KOMMO.accessToken}`,
-      "User-Agent": "meta-webhook-kommo/1.1",
+      "User-Agent": "meta-webhook-kommo/1.2",
       ...(options.headers || {}),
     },
   });
@@ -97,14 +335,10 @@ const FIELDS = {
   }
 };
 
-const unix   = (ts) => (ts ? Number(ts) : null);
-const num    = (v) => (v == null || v === "" ? null : Number(v) || null);
-const asArr  = (v) => Array.isArray(v) ? v : [];
-
 // ——— CFV build y merge write-once ———
 function leadCFV(p) {
   const out = [];
-  const add = (id, v) => (v !== null && v !== undefined && v !== "") &&
+  const add = (id, v) => (id && v !== null && v !== undefined && v !== "") &&
     out.push({ field_id: id, values: [{ value: v }] });
   add(FIELDS.LEAD.CTWA_CLID,          p.ctwa_clid);
   add(FIELDS.LEAD.CAMPAIGN_ID,        p.campaign_id);
@@ -119,6 +353,11 @@ function leadCFV(p) {
   add(FIELDS.LEAD.CAMPAIGN_NAME,      p.campaign_name);
   add(FIELDS.LEAD.MEDIA_BUDGET_HINT,  p.media_budget_hint);
   add(FIELDS.LEAD.DEAL_AMOUNT,        p.deal_amount);
+  // nuevos
+  add(CF_TECH_ID,        p.tech);
+  add(CF_MODEL_ID,       p.model);
+  add(CF_SITE_SOURCE_ID, p.site_source);
+  add(CF_PLACEMENT_ID,   p.placement);
   return out;
 }
 
@@ -136,6 +375,7 @@ function mergeAttribution(existingCFV = [], incoming) {
   const m = cfvToMap(existingCFV);
   const out = { ...incoming };
   const keep = (fid, key) => {
+    if (!fid) return;
     const have = m.get(fid);
     if (have != null && have !== "") out[key] = have;
   };
@@ -146,6 +386,11 @@ function mergeAttribution(existingCFV = [], incoming) {
   keep(FIELDS.LEAD.AD_ID,          "ad_id");
   keep(FIELDS.LEAD.PLATFORM,       "platform");
   keep(FIELDS.LEAD.CHANNEL_SOURCE, "channel_source");
+  // nuevos write-once
+  keep(CF_TECH_ID,        "tech");
+  keep(CF_MODEL_ID,       "model");
+  keep(CF_SITE_SOURCE_ID, "site_source");
+  keep(CF_PLACEMENT_ID,   "placement");
 
   const firstOld = num(m.get(FIELDS.LEAD.FIRST_TS));
   const lastOld  = num(m.get(FIELDS.LEAD.LAST_TS));
@@ -171,7 +416,7 @@ function phoneCandidates(raw) {
   if (d.length >= 10) {
     const last10 = d.slice(-10);
     s.add(last10);
-    s.add(`+52${last10}`); // ajusta prefijo a tu país si no es MX
+    s.add(`+52${last10}`);  // ajusta prefijo a tu país si no es MX
     s.add(`0052${last10}`); // variante internacional
   }
   return Array.from(s);
@@ -213,7 +458,7 @@ async function findLeadByPhone(rawPhone) {
           return full || leads[0];
         }
       }
-      // 2) leads?query (por si el número está pegado en nombre/nota)
+      // 2) leads?query (por si el número está en título/nota)
       const resL = await kommoRequest(`/api/v4/leads?query=${q}&limit=5`, { method: "GET" });
       const leads2 = resL?._embedded?.leads || [];
       if (leads2.length) {
@@ -237,31 +482,43 @@ async function updateLeadCFV(leadId, payload) {
 
 // ====== Enriquecimiento correcto ======
 
-// 2.a) Extraer IDs de querystring en referral.source_url
+// Parse querystring desde URL completa o "a=1&b=2"
 function parseQuery(qs) {
   const out = {};
   if (!qs) return out;
-  // qs puede venir como URL completa; usamos URL para parsear seguro
   try {
     const u = new URL(qs);
     u.searchParams.forEach((v,k)=>{ out[k]=v; });
     return out;
   } catch {
-    // si viene solo "a=1&b=2"
     for (const part of String(qs).replace(/^\?/, "").split("&")) {
       if (!part) continue;
       const [k,v] = part.split("=");
-      out[decodeURIComponent(k)] = decodeURIComponent(v || "");
+      out[dec(k)] = dec(v || "");
     }
     return out;
   }
 }
 
-// 3) Enriquecer vía Marketing API si YA tenemos ad_id y token
+// Lee "#ATTR ad_id=... adset_id=... tech=... model=..." del texto WA
+function parseAttrTagFromText(text) {
+  if (!text) return {};
+  const m = String(text).match(/#ATTR\s+(.+)$/m);
+  if (!m) return {};
+  const out = {};
+  for (const kv of m[1].trim().split(/\s+/)) {
+    const [k, ...rest] = kv.split("=");
+    if (!k || !rest.length) continue;
+    out[k] = rest.join("=");
+  }
+  return out;
+}
+
+// 3) Enriquecer vía Marketing API si YA tenemos ad_id (opcional)
 async function enrichFromAdId(ad_id) {
   if (!ENABLE_AD_RESOLVER || !META_ADS_TOKEN || !ad_id) return null;
   try {
-    const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${ad_id}?fields=id,name,adset_id,campaign_id&access_token=${encodeURIComponent(META_ADS_TOKEN)}`;
+    const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${ad_id}?fields=id,name,adset_id,campaign_id&access_token=${enc(META_ADS_TOKEN)}`;
     const r = await fetch(url);
     if (!r.ok) {
       const t = await r.text();
@@ -273,7 +530,7 @@ async function enrichFromAdId(ad_id) {
       ad_id: j.id || null,
       adset_id: j.adset_id || null,
       campaign_id: j.campaign_id || null,
-      campaign_name: null, // podrías añadir otro fetch a campaign para name si lo necesitas
+      campaign_name: null,
     };
   } catch (e) {
     console.warn("[AD RESOLVER] error:", e.message || e);
@@ -322,10 +579,7 @@ function scheduleRetry(key, fn, { max=3, delayMs=5*60*1000 } = {}) {
   (async () => {
     await wait(delayMs);
     try { await fn(); }
-    finally {
-      // si fn hizo update, normalmente logueará y puedes limpiar la key
-      // aquí no limpiamos automáticamente para conservar conteo
-    }
+    finally { /* conservamos conteo */ }
   })();
 }
 
@@ -362,6 +616,7 @@ app.post("/webhook", async (req, res) => {
 
     const product = (value?.messaging_product || "").toLowerCase();
     if (product && product !== "whatsapp") {
+      // Aquí podrías añadir manejo de Messenger/IG si te interesa
       return res.sendStatus(200);
     }
 
@@ -371,26 +626,46 @@ app.post("/webhook", async (req, res) => {
       return res.sendStatus(200);
     }
 
-    const referral = waMsg?.referral || value?.referral || null;
-    const ctwaClid = referral?.ctwa_clid || referral?.click_id || null;
+    const referral  = waMsg?.referral || value?.referral || null;
+    const ctwaClid  = referral?.ctwa_clid || referral?.click_id || null;
     const userPhone = waMsg?.from || null;
-    const ts = unix(waMsg?.timestamp);
-    const platform = "whatsapp";
+    const ts        = unix(waMsg?.timestamp);
+    const platform  = "whatsapp";
 
     // Resolver anuncios correctamente
     const ads = await resolveAdsInfo(referral);
 
+    // Extraer #ATTR del texto del primer mensaje
+    const textBody   = waMsg?.text?.body || "";
+    const fromTag    = parseAttrTagFromText(textBody); // ad_id/adset_id/campaign_id/site_source/placement/tech/model
+
+    // Normaliza tech/model (si vienen en #ATTR)
+    const techKey    = toTechKey(fromTag.tech);
+    const modelKey   = toModelKey(fromTag.model);
+
+    // Construir payload
     const payload = {
       platform,
       channel_source: referral ? "ctwa" : platform,
       ctwa_clid:      ctwaClid,
-      campaign_id:    ads.campaign_id || null,
-      adset_id:       ads.adset_id    || null,
-      ad_id:          ads.ad_id       || null,
+      campaign_id:    fromTag.campaign_id || ads.campaign_id || null,
+      adset_id:       fromTag.adset_id    || ads.adset_id    || null,
+      ad_id:          fromTag.ad_id       || ads.ad_id       || null,
+
+      // campos extra (write-once)
+      site_source:    fromTag.site_source || null,     // fb/ig/msg/an
+      placement:      fromTag.placement   || null,     // feed/story/reels/...
+      tech:           techKey || null,                 // si no se reconoce, queda null
+      model:          modelKey || null,                // si no se reconoce, queda null
+
+      // timestamps
       first_message_unix: ts,
       last_message_unix:  ts,
+
+      // metadatos
       thread_id:      waMsg?.id || null,
       entry_owner_id: entry?.id || null,
+
       // opcionales
       campaign_name:     null,
       media_budget_hint: null,
@@ -406,14 +681,14 @@ app.post("/webhook", async (req, res) => {
       const { updated, leadId } = await updateExistingLead({ payload, phoneE164: userPhone });
       if (updated) {
         console.log("[OK] Lead actualizado:", leadId);
-        // si se logró actualizar, puedes limpiar la llave de pendingKeys
+        // si se logró actualizar, limpia llaves de anti-race
         if (ctwaClid && pendingKeys.has(ctwaClid)) pendingKeys.delete(ctwaClid);
         if (userPhone && pendingKeys.has(userPhone)) pendingKeys.delete(userPhone);
       } else {
-        // programar reintento (5, 10, 15 min – 3 intentos)
+        // reintentos 5, 10, 15 min (máx 3)
         const key = ctwaClid || userPhone || `evt:${waMsg?.id}`;
         const attempts = pendingKeys.get(key)?.attempts || 0;
-        if (attempts === 0) scheduleRetry(key, act, { max: 3, delayMs: 5*60*1000 });
+        if (attempts === 0)      scheduleRetry(key, act, { max: 3, delayMs: 5*60*1000 });
         else if (attempts === 1) scheduleRetry(key, act, { max: 3, delayMs: 10*60*1000 });
         else if (attempts === 2) scheduleRetry(key, act, { max: 3, delayMs: 15*60*1000 });
       }
